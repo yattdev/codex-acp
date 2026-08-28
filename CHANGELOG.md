@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/agentclientprotocol/codex-acp/compare/v1.7.0...v1.8.0) (2026-08-28)
+
+
+### Features
+
+* support ACP session forks ([#435](https://github.com/agentclientprotocol/codex-acp/issues/435)) ([69ca755](https://github.com/agentclientprotocol/codex-acp/commit/69ca755d9878238aecf0737c0e4568b3bab37be2))
+
 ## [1.7.0](https://github.com/agentclientprotocol/codex-acp/compare/v1.6.2...v1.7.0) (2026-08-27)
 
 
