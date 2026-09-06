@@ -1,177 +1,220 @@
-name: Publish and Release
+name: Publish Kandev prerelease
 
 on:
   push:
-    branches:
-      - main
-  # Recovery path for a release whose tag exists but whose npm publish or
-  # registry update did not land. See docs/RELEASES.md.
+    branches: [main]
   workflow_dispatch:
     inputs:
-      ref:
-        description: Tag or commit to publish
+      release_tag:
+        description: Existing protected kandev-v* release tag
         required: true
         type: string
-      publish_npm:
-        description: Publish the package before updating the registry
-        required: true
-        default: true
-        type: boolean
 
 permissions: {}
 
 jobs:
-  # Every push to main re-computes the next version from the conventional commit
-  # messages and keeps a single release PR open. Merging that PR is what tags,
-  # releases and publishes; there is no manual release button.
   release-please:
-    if: ${{ github.event_name == 'push' }}
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment: release # Optional: for enhanced security
+    timeout-minutes: 15
     permissions:
+      actions: write
       contents: write
       issues: write
       pull-requests: write
-    steps:
-      # Generating a GitHub token, so that PRs and tags created by
-      # the release-please-action can trigger actions workflows.
-      - name: Generate GitHub token
-        uses: actions/create-github-app-token@v3
-        id: generate-token
-        with:
-          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
-          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
-
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
-        id: release
-        with:
-          token: ${{ steps.generate-token.outputs.token }}
-          # Do not add release-type here. The action ignores config-file whenever
-          # release-type is set, which would silently drop
-          # include-component-in-tag and start tagging codex-acp-vX.Y.Z instead of
-          # vX.Y.Z. The node release type is declared in that config instead, so
-          # nothing is lost by leaving this out.
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
-
-  # The gate for both paths: nothing is published unless this passes. Its `if`
-  # rather than `needs` alone decides whether a release is happening, because on
-  # workflow_dispatch the release-please job is skipped.
-  #
-  # Deliberately not in the `release` environment: OPENAI_API_KEY is a repository
-  # secret, so this needs nothing from it, and staying out keeps the job off the
-  # environment's deployment branch policy.
-  verify:
-    needs: [release-please]
-    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && inputs.publish_npm) || needs.release-please.outputs.release_created == 'true') }}
-    runs-on: ubuntu-latest
-    # Without this a stalled step burns the full 6h runner limit before anyone
-    # notices the release did not publish. A hung apt mirror already cost one
-    # release that way. Sized for the worst case of its steps: apt retries, then
-    # the unit and e2e suites, both of which run their files serially.
-    timeout-minutes: 40
-    permissions:
-      contents: read
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
-      - uses: actions/setup-node@v7
+          token: ${{ github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - name: Dispatch secretless CI for the release PR
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_branch=$(gh pr list --state open --label 'autorelease: pending' \
+            --json headRefName --jq 'if length == 1 then .[0].headRefName else error("expected one release PR") end')
+          config_path='release-please-config.json'
+          config_sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${config_path}?ref=${release_branch}" --jq .sha)
+          config=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${config_path}?ref=${release_branch}" \
+            -H 'Accept: application/vnd.github.raw')
+          if jq -e '.packages["."]["release-as"] != null' <<<"$config" >/dev/null; then
+            content=$(jq 'del(.packages["."]["release-as"])' <<<"$config" | base64 -w0)
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${config_path}" \
+              -f message='chore: consume initial Kandev release override' \
+              -f content="$content" \
+              -f sha="$config_sha" \
+              -f branch="$release_branch" >/dev/null
+          fi
+          gh workflow run ci.yml --ref "$release_branch"
+      - name: Dispatch publication from the exact release tag
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh workflow run publish.yml --ref "$TAG" -f release_tag="$TAG"
+
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Validate release identity
+        env:
+          TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/tags/$TAG" ]]
+          [[ "$TAG" =~ ^kandev-v[0-9]+\.[0-9]+\.[0-9]+-kandev\.[0-9]+$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-      - name: Configure sandboxing
-        timeout-minutes: 15
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.1.2
+        with:
+          bun-version: 1.3.11
+      - name: Repeat secretless release gates
+        env:
+          BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
         run: |
-          # Acquire::*::Timeout only guards a single socket operation, so a mirror
-          # that stalls once the headers are in never trips it -- that ate a 6h
-          # runner limit, then a 5min step cap. Kill each attempt from the outside
-          # and retry the fetch instead. No Acquire::Retries: apt retrying inside a
-          # killed window would just burn the budget without ever finishing.
-          #
-          # The per-attempt budgets are generous on purpose. When the image's
-          # package lists are stale, a healthy `update` pulls ~5MB of indexes and
-          # takes about two minutes; a tighter cap killed it mid-download three
-          # times in a row and turned "slow but fine" into a failed release.
-          # Languages=none drops the Translation-* files, which nothing here reads.
-          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Languages=none)
-          for attempt in 1 2; do
-            if timeout 300 sudo apt-get "${apt_opts[@]}" update \
-              && timeout 120 sudo apt-get "${apt_opts[@]}" install --yes bubblewrap; then
-              installed=yes
+          npm ci --include=dev
+          npm run verify:fork
+          npm run typecheck
+          npm run test:guarded-tty
+          npm test
+          npm run build
+          npm run bundle:all
+          npm run package:all
+          npm run verify:package
+          npm run test:packed-guarded-tty
+          npm audit --audit-level=high
+          npm audit --omit=dev
+      - name: Build the exact reviewed npm tarball
+        id: npm-candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_dir="$RUNNER_TEMP/npm-candidate"
+          mkdir -p "$candidate_dir"
+          report=$(npm pack --json --ignore-scripts --pack-destination "$candidate_dir")
+          printf '%s\n' "$report" > "$candidate_dir/pack-report.json"
+          filename=$(jq -er '.[0].filename' <<<"$report")
+          integrity=$(jq -er '.[0].integrity' <<<"$report")
+          shasum=$(jq -er '.[0].shasum' <<<"$report")
+          test -f "$candidate_dir/$filename"
+          echo "tarball=$candidate_dir/$filename" >> "$GITHUB_OUTPUT"
+          echo "integrity=$integrity" >> "$GITHUB_OUTPUT"
+          echo "shasum=$shasum" >> "$GITHUB_OUTPUT"
+      - name: Verify release archives and create immutable checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find dist/bin -maxdepth 1 -type f -name 'codex-acp-kandev-*.zip' -print | sort)
+          test "${#archives[@]}" -eq 6
+          for archive in "${archives[@]}"; do
+            unzip -t "$archive"
+          done
+          dist/bin/codex-acp-kandev-x64-linux --version \
+            | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'
+          sha256sum "${archives[@]}" > dist/bin/SHA256SUMS
+          sha256sum --check dist/bin/SHA256SUMS
+      - name: Attest release archives and checksum manifest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            dist/bin/*.zip
+            dist/bin/SHA256SUMS
+      - name: Verify release attestations before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in dist/bin/*.zip dist/bin/SHA256SUMS; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Upload immutable assets to the Kandev prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets)
+          for artifact in dist/bin/*.zip dist/bin/SHA256SUMS; do
+            name=$(basename "$artifact")
+            if jq -e --arg name "$name" '.assets[]? | select(.name == $name)' <<<"$release_assets" >/dev/null; then
+              download_dir=$(mktemp -d)
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir "$download_dir"
+              cmp "$artifact" "$download_dir/$name"
+            else
+              gh release upload "$TAG" "$artifact" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+      - name: Publish or verify the immutable npm version
+        env:
+          EXPECTED_TAG: ${{ inputs.release_tag }}
+          CANDIDATE_TARBALL: ${{ steps.npm-candidate.outputs.tarball }}
+          EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
+          EXPECTED_NPM_SHASUM: ${{ steps.npm-candidate.outputs.shasum }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(node -p "require('./package.json').version")
+          expected_version=${EXPECTED_TAG#kandev-v}
+          [[ "$package_version" == "$expected_version" ]]
+          [[ -f "$CANDIDATE_TARBALL" ]]
+          latest_before=$(npm view '@yattdev/codex-acp-kandev' dist-tags.latest 2>/dev/null || true)
+          if ! npm publish "$CANDIDATE_TARBALL" --access public --tag kandev; then
+            existing=$(npm view "@yattdev/codex-acp-kandev@$expected_version" version 2>/dev/null || true)
+            [[ "$existing" == "$expected_version" ]]
+            echo '::notice::The exact immutable npm version already exists; repeating post-publish verification.'
+          fi
+          metadata=''
+          for attempt in {1..12}; do
+            metadata=$(npm view "@yattdev/codex-acp-kandev@$expected_version" version dist --json 2>/dev/null || true)
+            if jq -e '.version and .dist.integrity and .dist.shasum' <<<"$metadata" >/dev/null 2>&1; then
               break
             fi
-            echo "apt attempt ${attempt} stalled or failed, retrying"
-            sleep 10
+            metadata=''
+            sleep 5
           done
-          if [ -z "${installed:-}" ]; then
-            echo "::error::bubblewrap install failed after 3 attempts"
-            exit 1
-          fi
-          sudo sysctl -w kernel.unprivileged_userns_clone=1
-          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - name: Run e2e tests
-        # The suite drives a live model, so a wedged turn hangs instead of
-        # failing. Bound it well above the ~3min happy path.
-        timeout-minutes: 15
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: npm run test:e2e
+          published=$(jq -er '.version' <<<"$metadata")
+          published_integrity=$(jq -er '.dist.integrity' <<<"$metadata")
+          published_shasum=$(jq -er '.dist.shasum' <<<"$metadata")
+          kandev_tag=$(npm view '@yattdev/codex-acp-kandev' dist-tags.kandev)
+          latest_after=$(npm view '@yattdev/codex-acp-kandev' dist-tags.latest 2>/dev/null || true)
+          [[ "$published" == "$expected_version" ]]
+          [[ "$published_integrity" == "$EXPECTED_NPM_INTEGRITY" ]]
+          [[ "$published_shasum" == "$EXPECTED_NPM_SHASUM" ]]
+          [[ "$kandev_tag" == "$expected_version" ]]
+          [[ "$latest_after" == "$latest_before" ]]
+          [[ "$latest_after" != "$expected_version" ]]
+          verification_dir=$(mktemp -d)
+          npm install --prefix "$verification_dir" --ignore-scripts \
+            "@yattdev/codex-acp-kandev@$expected_version"
+          npm audit signatures --prefix "$verification_dir"
+          node scripts/verify-npm-provenance.mjs "$expected_version" "$EXPECTED_TAG"
 
-  publish-npm:
-    name: Publish to npm
-    needs: [release-please, verify]
-    if: ${{ always() && needs.verify.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: release # Optional: for enhanced security
-    permissions:
-      contents: read
-      id-token: write # npm trusted publishing, so there is no npm token
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
-      # Setup .npmrc file to publish to npm
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-      - run: npm ci
-      # prepublishOnly builds the bundle.
-      - run: npm publish --access public
-
-  trigger-registry-update:
-    needs: publish-npm
-    if: ${{ always() && (needs.publish-npm.result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.publish_npm)) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    environment: release
-    permissions: {}
-    steps:
-      - name: Generate token scoped to the registry repo
-        uses: actions/create-github-app-token@v3
-        id: registry-token
-        with:
-          app-id: ${{ secrets.REGISTRY_UPDATER_APP_ID }}
-          private-key: ${{ secrets.REGISTRY_UPDATER_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: registry
-
-      - name: Dispatch registry version update
-        env:
-          GH_TOKEN: ${{ steps.registry-token.outputs.token }}
-        run: |
-          gh workflow run update-versions.yml \
-            --repo ${{ github.repository_owner }}/registry \
-            --ref main \
-            -f apply=true \
-            -f agents=codex-acp
+# The one-time npm scope/package and trusted-publisher binding is Human-owned.
+# This workflow has no token fallback, does not update an upstream registry, and
+# performs no deployment.

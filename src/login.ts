@@ -46,19 +46,19 @@ function parseArgs(args: string[]): LoginOptions | null {
 
 function printHelp() {
     console.log(`
-codex-acp login - Initialize and login to Codex with client context
+codex-acp-kandev login - Initialize and login to Codex with client context
 
 Usage:
-  codex-acp login [options]
+  codex-acp-kandev login [options]
 
 Options:
-  --client-name <name>       Client application name (default: "codex-acp")
-  --client-title <title>     Client application title (default: "Codex ACP")
+  --client-name <name>       Client application name (default: "codex-acp-kandev")
+  --client-title <title>     Client application title (default: "Kandev Codex ACP")
   --client-version <version> Client application version (default: "${packageJson.version}")
   --help, -h                 Show this help message
 
 Example:
-  codex-acp login --client-name="AIA Plugin" --client-title="AI Assistant" --client-version="1.0.0"
+  codex-acp-kandev login --client-name="Kandev" --client-title="Kandev" --client-version="1.0.0"
 `);
 }
 
@@ -72,8 +72,8 @@ async function login(options: LoginOptions): Promise<boolean> {
 
     try {
         const clientInfo: ClientInfo = {
-            name: options.clientName ?? "codex-acp",
-            title: options.clientTitle ?? "Codex ACP",
+            name: options.clientName ?? "codex-acp-kandev",
+            title: options.clientTitle ?? "Kandev Codex ACP",
             version: options.clientVersion ?? packageJson.version,
         };
 

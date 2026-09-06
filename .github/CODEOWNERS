@@ -1,0 +1,19 @@
+# The yattdev owner is the initial accountable security and release owner.
+* @yattdev
+/src/GuardedTtyExec.ts @yattdev
+/src/AcpExtensions.ts @yattdev
+/src/CodexAcpServer.ts @yattdev
+/src/CodexAppServerClient.ts @yattdev
+/src/index.ts @yattdev
+/src/app-server/ @yattdev
+/fork-compatibility.json @yattdev
+/package.json @yattdev
+/package-lock.json @yattdev
+/SECURITY.md @yattdev
+/NOTICE @yattdev
+/CHANGELOG-KANDEV.md @yattdev
+/docs/guarded-tty-kandev.md @yattdev
+/docs/MAINTENANCE.md @yattdev
+/.github/workflows/ @yattdev
+/scripts/release-preflight.sh @yattdev
+/scripts/verify-fork-policy.mjs @yattdev

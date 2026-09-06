@@ -5,27 +5,134 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+          cache: npm
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.1.2
         with:
           bun-version: 1.3.11
-      - name: Install dependencies
-        run: npm ci
+      - name: Install exact dependencies
+        run: npm ci --include=dev
+      - name: Verify maintained-fork policy
+        run: npm run verify:fork
       - name: Typecheck
         run: npm run typecheck
+      - name: Run guarded-TTY contract tests
+        run: npm run test:guarded-tty
       - name: Run unit tests
         run: npm test
-      - name: Bundle binaries
+      - name: Build npm entry point
+        run: npm run build
+      - name: Build all six binaries
+        env:
+          BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
         run: npm run bundle:all
+      - name: Package all six binaries
+        run: npm run package:all
+      - name: Verify npm package allowlist and secret scan
+        run: npm run verify:package
+      - name: Exercise the installed tarball against the fake App Server
+        run: npm run test:packed-guarded-tty
+      - name: Verify archive inventory and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find dist/bin -maxdepth 1 -type f -name 'codex-acp-kandev-*.zip' -print | sort)
+          test "${#archives[@]}" -eq 6
+          for archive in "${archives[@]}"; do
+            unzip -t "$archive"
+          done
+          sha256sum "${archives[@]}" > dist/bin/SHA256SUMS
+          sha256sum --check dist/bin/SHA256SUMS
+      - name: Smoke-test native packaged CLI
+        run: dist/bin/codex-acp-kandev-x64-linux --version | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'
+      - name: Audit complete dependency graph
+        run: npm audit --audit-level=high
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
+      - name: Retain checksums and archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-acp-kandev-candidate-${{ github.sha }}
+          path: |
+            dist/bin/*.zip
+            dist/bin/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke-native:
+    needs: ci
+    name: Smoke ${{ matrix.archive }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            archive: codex-acp-kandev-x64-linux
+            binary: codex-acp-kandev-x64-linux
+          - os: ubuntu-24.04-arm
+            archive: codex-acp-kandev-arm64-linux
+            binary: codex-acp-kandev-arm64-linux
+          - os: macos-15-intel
+            archive: codex-acp-kandev-x64-darwin
+            binary: codex-acp-kandev-x64-darwin
+          - os: macos-15
+            archive: codex-acp-kandev-arm64-darwin
+            binary: codex-acp-kandev-arm64-darwin
+          - os: windows-2025
+            archive: codex-acp-kandev-x64-windows
+            binary: codex-acp-kandev-x64-windows.exe
+          - os: windows-11-arm
+            archive: codex-acp-kandev-arm64-windows
+            binary: codex-acp-kandev-arm64-windows.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-acp-kandev-candidate-${{ github.sha }}
+          path: dist/bin
+      - name: Extract the matching packaged CLI on Linux or macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          mkdir smoke
+          unzip -q "dist/bin/$ARCHIVE.zip" -d smoke
+      - name: Extract the matching packaged CLI on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        run: Expand-Archive -LiteralPath "dist/bin/$env:ARCHIVE.zip" -DestinationPath smoke
+      - name: Execute the matching packaged CLI
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          chmod +x "smoke/$BINARY"
+          "smoke/$BINARY" --version | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'

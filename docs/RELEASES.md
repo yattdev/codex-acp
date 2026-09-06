@@ -1,141 +1,125 @@
-# Releases
+# Kandev fork releases
 
-Releases are automated by [release-please](https://github.com/googleapis/release-please)
-in [`.github/workflows/publish.yml`](../.github/workflows/publish.yml). Every push
-to `main` re-computes the next version from the conventional commit messages and
-keeps a single release PR open, titled `chore(main): release X.Y.Z` and labelled
-`autorelease: pending`.
+This repository publishes the visibly fork-specific package
+`@yattdev/codex-acp-kandev`. It must never publish the upstream package name,
+create an upstream-style `v*` tag, update the ACP registry, or move npm's
+`latest` dist-tag.
 
-Merging that PR is what releases. It tags `vX.Y.Z`, creates the GitHub release,
-runs the verification suite, publishes to npm, and dispatches a version update to
-the agent registry.
+The initial release identity is fixed:
 
-There is no manual release button, and versions are never typed in by hand: the
-version is an output of the commit history, not an input.
+- npm: `@yattdev/codex-acp-kandev@1.7.0-kandev.1`
+- channel: `kandev`
+- CLI: `codex-acp-kandev`
+- Git tag/release: `kandev-v1.7.0-kandev.1`
 
-## Releasing
+## Human-owned bootstrap gate
 
-```sh
-npm run release:preflight
-```
+Before the first publish, a yattdev owner must claim or bootstrap the npm scope
+and package, then bind npm trusted publishing to the public
+`yattdev/codex-acp` repository, `.github/workflows/publish.yml`, its protected
+`release` environment, and GitHub-hosted runners. The owner must also configure
+review protection for `main`, `kandev-v*` tags, and the release environment.
 
-This reports the open release PR, the version it will ship, and checks that the
-repository is in a state where merging is safe. Nothing has to be remembered —
-if it exits non-zero, follow what it prints instead of merging.
+That setup is performed once by the human owner and recorded as a redacted
+receipt. Do not invent the receipt, copy an npm token into GitHub, or add a
+long-lived publishing credential as a fallback. A missing or rejected OIDC
+exchange stops the release.
 
-Then merge it, using the PR number the preflight printed:
+## Candidate verification
 
-```sh
-gh pr merge <pr-number> --squash
-gh run watch "$(gh run list --workflow=publish.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
-```
-
-The run is looked up rather than picked interactively, so this is safe to script.
-If the workflow has already finished, `gh run list --workflow=publish.yml` shows
-the outcome instead.
-
-Merging main requires no review, so a green preflight and `ci` are the only gates
-before the merge. After it, the `verify` job re-runs typecheck, unit tests and the
-e2e suite against the release commit, and nothing is published unless it passes.
-Once the workflow finishes, confirm both outputs landed:
+Run from the exact reviewed release commit:
 
 ```sh
-gh release view "v<version>"
-npm view "@agentclientprotocol/codex-acp@<version>"
+npm ci --include=dev
+npm run verify:fork
+npm run typecheck
+npm run test:guarded-tty
+npm test
+npm run build
+npm run bundle:all
+npm run package:all
+npm run verify:package
+npm run test:packed-guarded-tty
+npm audit --audit-level=high
+npm audit --omit=dev
+sha256sum dist/bin/*.zip > dist/bin/SHA256SUMS
+npm pack --json --ignore-scripts --pack-destination "$(mktemp -d)"
 ```
 
-## How the version is chosen
+Record the source commit, `fork-compatibility.json` SHA-256, package filename,
+npm integrity and shasum, archive checksums, Node/npm/Bun versions, and test
+summary. `package:all` normalizes executable timestamps and ZIP metadata, so a
+retry of the same commit produces byte-identical archives. CI downloads the
+candidate archives and executes each one on the matching hosted Linux, macOS,
+or Windows x64/arm64 runner. Downstream acceptance uses the exact recorded npm
+tarball before publication.
 
-Squash merges use the PR title as the commit subject, so the PR title decides the
-next version. [`conventional-prs.yml`](../.github/workflows/conventional-prs.yml)
-rejects titles release-please would not understand.
+`npm run release:preflight` additionally verifies the open release PR, exact
+version/tag/config, the core CI job and all six native smoke checks, repository
+identity, policy manifest, and the presence of the human bootstrap receipt in
+the protected release process.
 
-| PR title prefix                                                     | Effect                      |
-| ------------------------------------------------------------------- | --------------------------- |
-| `fix:`, `perf:`, `revert:`                                          | patch, e.g. 1.1.14 → 1.1.15 |
-| `feat:`                                                             | minor, e.g. 1.1.14 → 1.2.0  |
-| any of the above with `!`, or BREAKING CHANGE                       | major, e.g. 1.1.14 → 2.0.0  |
-| `docs:`, `style:`, `chore:`, `refactor:`, `test:`, `build:`, `ci:`  | no release on their own     |
+## Automated release
 
-The last row is a property of release-please's default changelog sections: those
-types are hidden, so when nothing else has landed since the last tag the release
-notes come out empty and no release PR is opened at all. They still ride along in
-the next release a `feat:` or `fix:` triggers; they just do not appear in the
-changelog.
+Release Please maintains the fork changelog and uses prerelease versioning with
+the `kandev` component. Merging the reviewed release PR creates a
+`kandev-v<version>` GitHub prerelease. The protected workflow repeats the
+secretless gates and publishes with the only permitted command. Release Please
+uses the scoped `GITHUB_TOKEN`, so the workflow explicitly dispatches `ci.yml`
+on the release PR branch after creating or updating it. This gives the reviewed
+release commit the same required checks without a PAT or GitHub App secret.
 
-The scheduled Codex bumps opened by
-[`codex-update.yml`](../.github/workflows/codex-update.yml) title themselves
-`fix:` on purpose. They run close to daily, and titling them `feat:` would walk
-the minor version every time a dependency moved.
-
-The package is past 1.0.0, so a `!` really does ship a major version — unlike
-pre-1.0 repositories, there is no `bump-minor-pre-major` safety net to fall back
-on (setting it would have no effect above 1.0.0). Treat `!` in a PR title as an
-explicit decision to release a major.
-
-Note that `config-file` only takes effect while the workflow does **not** pass a
-`release-type` input to the action — with `release-type` set, the action ignores
-the config entirely. The release type is declared inside the config instead.
-
-Because the config is what is read, it also has to say
-`"include-component-in-tag": false`. Left at its default, release-please derives a
-component from the package name and tags `codex-acp-vX.Y.Z` instead of `vX.Y.Z`.
-That renames the tag every step here looks up, and because no tag under the new
-scheme exists, it also walks the entire commit history into the changelog rather
-than just what landed since the last release. The preflight checks the tag
-release-please is going to use, so this cannot reach a published release.
-
-If a specific version has to be forced, add `"release-as": "X.Y.Z"` to
-`release-please-config.json` in its own PR, release, then remove it again.
-
-## Recovering a stalled release
-
-### The release PR merged but nothing was tagged
-
-The preflight fails with `release-please is jammed`. While a merged release PR
-still carries `autorelease: pending`, release-please refuses to open any new
-release PR at all, so every later release stalls silently until this is cleared.
-
-Take the release notes release-please already wrote into the changelog, create
-the missing release, then move the label the way release-please would have:
+The initial configuration contains a one-time `release-as` override for
+`1.7.0-kandev.1`. After Release Please creates that release PR, the workflow
+removes the override on the PR branch before dispatching CI. The reviewed merge
+therefore leaves no persistent override: later fixes or features advance the
+Kandev prerelease revision instead of attempting to reuse an immutable version.
 
 ```sh
-awk '/^## \[<version>\]/{f=1;print;next} /^## \[/{f=0} f' CHANGELOG.md > notes.md
-gh release create "v<version>" --target <merge-commit-sha> --notes-file notes.md
-gh pr edit <pr-number> --remove-label "autorelease: pending" \
-  --add-label "autorelease: tagged"
+npm publish "$CANDIDATE_TARBALL" --access public --tag kandev
 ```
 
-Then publish the tag as described below.
+GitHub-hosted npm OIDC supplies the short-lived publishing identity. npm
+provenance is enabled in `package.json`. Before npm publication, the workflow
+builds six archives, creates `dist/bin/SHA256SUMS`, attests and verifies all
+seven files, and uploads them to the matching GitHub prerelease. It then
+publishes the already-built reviewed tarball—not a newly packed directory—and
+requires the registry `dist.integrity` and `dist.shasum` to match the candidate
+on both first publication and retry. Existing assets must match byte-for-byte
+and are never overwritten. There is no deployment or registry dispatch.
 
-### The tag exists but npm or the registry is missing
-
-npm publishes through OIDC from inside the workflow, so this cannot be done from
-a laptop. Re-run the publish workflow against the existing tag:
+Verify the immutable result:
 
 ```sh
-gh workflow run publish.yml -f ref="v<version>" -f publish_npm=true
+npm view '@yattdev/codex-acp-kandev@<version>' name version dist.integrity dist.shasum repository --json
+npm view '@yattdev/codex-acp-kandev' dist-tags --json
+npm audit signatures
+EXPECTED_NPM_INTEGRITY='<candidate-integrity>' EXPECTED_NPM_SHASUM='<candidate-shasum>' \
+  node scripts/verify-npm-provenance.mjs '<version>' 'kandev-v<version>'
+gh release view 'kandev-v<version>' --repo yattdev/codex-acp
+sha256sum --check dist/bin/SHA256SUMS
+gh attestation verify dist/bin/<archive> --repo yattdev/codex-acp
 ```
 
-This re-runs `verify` against that ref before publishing, so a flaky e2e run will
-block it; re-run the workflow rather than working around it.
+The `kandev` tag must resolve to the exact release. `latest` must remain absent
+or unchanged. Provenance must name this repository, this workflow, and the exact
+release ref. Downstream pins the package version and lockfile integrity; it does
+not consume a dist-tag at runtime.
 
-npm versions are immutable. If the package already published and only the
-registry update failed, pass `-f publish_npm=false` so the run skips verification
-and publishing and only re-dispatches the registry update.
+## Updates and rollback
 
-## Credentials and repository settings
+Conventional `feat`, `fix`, `perf`, and `revert` commits advance the maintained
+Kandev prerelease line. An upstream-base or Codex update is always a reviewed
+compatibility change; it may not widen ranges or regenerate types silently.
 
-| Secret                                                        | Used for                                                          |
-| ------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `RELEASE_PLZ_APP_ID`, `RELEASE_PLZ_APP_PRIVATE_KEY`           | App token for release PRs and tags, so they can trigger workflows |
-| `REGISTRY_UPDATER_APP_ID`, `REGISTRY_UPDATER_APP_PRIVATE_KEY` | App token scoped to the `registry` repository                     |
-| `OPENAI_API_KEY`                                              | The e2e suite in the `verify` job                                 |
+Published npm versions are immutable. On regression, Kandev omits the guarded
+tool and restores its preceding reviewed exact pin. Deprecate the bad version,
+publish a new reviewed replacement, and move only `kandev` after verification.
+Never unpublish as a rollback mechanism and never touch `latest`.
 
-Publishing to npm uses OIDC trusted publishing, so there is no npm token. The
-release-please, publish and registry jobs run in the `release` environment.
-
-Because those jobs are now triggered by pushes to `main` rather than by a `v*`
-tag, the `release` environment's deployment branch policy has to allow the `main`
-branch in addition to `v*` tags. Without it every release job fails before it
-starts with a branch-not-allowed error.
+If the GitHub release exists but publication or attestation failed, fix the
+underlying gate and rerun the failed job against the same protected tag. The
+workflow accepts an already-published exact version only so it can repeat the
+registry, signature, and provenance checks; mismatched release assets or npm
+identity still fail closed. Never create a different package from an existing
+tag or reuse an npm version.

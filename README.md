@@ -1,87 +1,109 @@
-# ACP adapter for Codex CLI
+# Kandev-owned Codex ACP adapter
 
-[![npm version](https://img.shields.io/npm/v/%40agentclientprotocol%2Fcodex-acp)](https://www.npmjs.com/package/@agentclientprotocol/codex-acp)
+> **This is a Kandev-specific derivative.** It is published as
+> `@yattdev/codex-acp-kandev`, is maintained by yattdev, and is not the
+> upstream `@agentclientprotocol/codex-acp` package. The private
+> `_kandev/guarded_tty/*` methods are not standard or provider-neutral ACP.
 
-Use [OpenAI Codex](https://github.com/openai/codex) from [Agent Client Protocol](https://agentclientprotocol.com/) clients.
+This package carries a narrow guarded-TTY bridge for Kandev while preserving
+the upstream Codex ACP adapter. It starts the Codex App Server, translates ACP
+requests into Codex operations, and maps Codex events back to the client.
 
-`codex-acp` is a stdio ACP agent server. It starts the Codex App Server, translates ACP requests into Codex operations, and maps Codex events back into the client.
+The upstream project and inherited history are available at
+[agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp).
+See [NOTICE](NOTICE) for provenance and attribution.
 
-## Features
+## Install the Kandev channel
 
-- ChatGPT, API key, and client-provided custom gateway authentication.
-- Model, reasoning effort, fast mode, approval, and sandbox mode configuration.
-- Text prompts, embedded context, images, resource links, and additional workspace directories.
-- Shell command, file change, [permission request](docs/permission-extension.md), MCP tool call, terminal output, reasoning, plan, web search, image generation, image view, token usage, and review events.
-- [Native ACP subagent sessions](docs/subagent-sessions.md) (after capability negotiation) with separate child histories and root-routed permissions; a legacy tool-call fallback otherwise.
-- Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md).
-- A per-turn [agent file-change report](docs/agent-file-change-report.md) after capability negotiation.
-- Client-provided MCP servers over command-based stdio config and HTTP transport.
-- Slash commands: `/status`, `/mcp`, `/skills`, `/goal`, `/review`, `/review-branch`, `/review-commit`, `/compact`, and `/logout`, as well as configured skills.
-
-## Installation
-
-Run the published package directly:
+Consumers must pin the complete package version and integrity. Do not use a
+range and do not install the upstream package as a substitute.
 
 ```bash
-npx -y @agentclientprotocol/codex-acp
+npx -y @yattdev/codex-acp-kandev@1.7.0-kandev.1
 ```
 
-Or install it globally:
+Or install the exact version globally:
 
 ```bash
-npm install -g @agentclientprotocol/codex-acp
-codex-acp --version
+npm install -g @yattdev/codex-acp-kandev@1.7.0-kandev.1
+codex-acp-kandev --version
 ```
 
-The npm package includes a compatible `@openai/codex` dependency. Set `CODEX_PATH` only when you want the adapter to run a different Codex binary:
+The package is published only on the npm `kandev` dist-tag. It never owns or
+moves npm's `latest` tag.
 
-```bash
-CODEX_PATH=/path/to/codex npx -y @agentclientprotocol/codex-acp
-```
+## Private guarded-TTY contract
 
-## Authentication
+The version-1 contract is intentionally Kandev-namespaced:
 
-The adapter advertises ACP auth methods during initialization. Clients can authenticate with:
+- capability: `kandev.guarded-tty-exec`
+- capability probe: `_kandev/guarded_tty/capability`
+- one-shot execution: `_kandev/guarded_tty/exec`
 
-- ChatGPT login. Set `NO_BROWSER=1` to hide this method in remote or browserless environments.
-- API key via `CODEX_API_KEY` or `OPENAI_API_KEY`.
-- A custom OpenAI-compatible gateway, when the client opts in to the gateway auth capability.
+The bridge is not a generic authorization boundary. Kandev must authorize the
+request before calling it, and the adapter must already be running inside the
+Kandev-controlled confinement for the exact active session. Do not expose this
+package as a general remote ACP endpoint to untrusted clients.
 
-## Runtime options
+The caller may provide only `sessionId` and a bounded, non-empty `argv`. The
+adapter derives the working directory and sandbox policy from trusted session
+state, creates the process ID, forces `tty: true`, streams output with fixed
+time and byte ceilings, and exposes no stdin/write/resize/attach lifecycle.
+See [the guarded-TTY contract and threat model](docs/guarded-tty-kandev.md).
 
-- `CODEX_API_KEY` - API key used when the API-key auth method is selected. Takes precedence over `OPENAI_API_KEY`.
-- `OPENAI_API_KEY` - fallback API key used when the API-key auth method is selected.
-- `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency.
-- `CODEX_CONFIG` - JSON object merged into the Codex session config.
-- `MODEL_PROVIDER` - model provider to pass to Codex for new sessions.
-- `DEFAULT_AUTH_REQUEST` - ACP auth request JSON used when Codex requires authentication.
-- `INITIAL_AGENT_MODE` - initial mode id: `read-only`, `agent`, or `agent-full-access`.
-- `NO_BROWSER` - hide browser-based ChatGPT auth when set.
-- `APP_SERVER_LOGS` - directory for adapter logs.
+## Compatibility
+
+`1.7.0-kandev.1` supports only the exact compatibility envelope recorded in
+[fork-compatibility.json](fork-compatibility.json):
+
+- upstream source base `69ca755d9878238aecf0737c0e4568b3bab37be2`
+- `@openai/codex` `0.148.0`
+- `@agentclientprotocol/sdk` `1.4.0`
+- guarded-TTY capability version `1`
+
+No other upstream commit or dependency range is implied. Downstream consumers
+must negotiate the exact capability and fail closed on any identity, version,
+method, session, receipt, or integrity mismatch.
+
+## Runtime environment
+
+The inherited adapter supports these environment variables:
+
+- `CODEX_API_KEY` — API key selected by the ACP authentication flow.
+- `OPENAI_API_KEY` — fallback API key selected by that flow.
+- `CODEX_PATH` — optional path to a compatible Codex executable.
+- `CODEX_CONFIG` — JSON merged into Codex session configuration.
+- `MODEL_PROVIDER` — model provider for new sessions.
+- `DEFAULT_AUTH_REQUEST` — ACP auth request JSON.
+- `INITIAL_AGENT_MODE` — `read-only`, `agent`, or `agent-full-access`.
+- `NO_BROWSER` — hide browser-based login when set.
+- `APP_SERVER_LOGS` — directory for adapter logs.
+
+The guarded-TTY methods cannot set or alter any of these values.
 
 ## Development
 
 ```bash
-npm install
-npm run start
+npm ci --include=dev
 npm run typecheck
+npm run test:guarded-tty
 npm test
+npm run build
+npm run verify:fork
 ```
 
-Build standalone binaries in `dist/bin` with:
+Building the six standalone binaries additionally requires Bun 1.3.11:
 
 ```bash
 npm run bundle:all
+npm run package:all
+npm run verify:package
 ```
 
-See [readme-dev.md](readme-dev.md) for local client configuration, binary packaging, and Codex type regeneration.
-
-### Subagent sessions
-
-Subagent sessions follow the draft [ACP subagent RFD](https://github.com/agentclientprotocol/agent-client-protocol/pull/1992) and are enabled only after bilateral capability negotiation during `initialize`. Without native negotiation, the subagent lifecycle stays an ordinary ACP tool call.
-
-See [docs/subagent-sessions.md](docs/subagent-sessions.md) for the negotiation, lifecycle events, `session/load` reconstruction, and legacy fallback details.
+See [maintenance policy](docs/MAINTENANCE.md), [release procedure](docs/RELEASES.md),
+and [security policy](SECURITY.md).
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the Apache 2.0 License.
+This derivative remains licensed under Apache-2.0. Modified-file and upstream
+attribution obligations are documented in [NOTICE](NOTICE).
