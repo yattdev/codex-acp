@@ -113,6 +113,8 @@ assert(assetUploadIndex < publicationIndex,
     "fallible archive gates must complete before npm publication");
 assert(publishWorkflow.includes("npm run test:packed-guarded-tty"),
     "publication must exercise the installed tarball contract");
+assert(publishWorkflow.includes("npm audit --audit-level=high"),
+    "publication must audit build and runtime dependencies");
 
 const e2eWorkflow = readFileSync(".github/workflows/e2e.yml", "utf8");
 assert(e2eWorkflow.includes("npm run test:packed-guarded-tty"),
@@ -125,6 +127,10 @@ assert(updateWorkflow.includes("security-advisories"),
     "compatibility inspection must query upstream security advisories");
 assert(updateWorkflow.includes("npm audit --audit-level=high"),
     "compatibility inspection must audit pinned dependencies");
+
+const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
+assert(ciWorkflow.includes("npm audit --audit-level=high"),
+    "pull-request CI must audit build and runtime dependencies");
 
 for (const workflow of ["ci.yml", "e2e.yml", "codex-update.yml", "publish.yml"]) {
     const content = readFileSync(`.github/workflows/${workflow}`, "utf8");

@@ -65,6 +65,8 @@ jobs:
           sha256sum --check dist/bin/SHA256SUMS
       - name: Smoke-test native packaged CLI
         run: dist/bin/codex-acp-kandev-x64-linux --version | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'
+      - name: Audit complete dependency graph
+        run: npm audit --audit-level=high
       - name: Audit production dependencies
         run: npm audit --omit=dev
       - name: Retain checksums and archives

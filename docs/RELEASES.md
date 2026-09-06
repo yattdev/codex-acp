@@ -40,6 +40,7 @@ npm run bundle:all
 npm run package:all
 npm run verify:package
 npm run test:packed-guarded-tty
+npm audit --audit-level=high
 npm audit --omit=dev
 sha256sum dist/bin/*.zip > dist/bin/SHA256SUMS
 npm pack --json --pack-destination "$(mktemp -d)"

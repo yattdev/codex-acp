@@ -106,6 +106,7 @@ jobs:
           npm run package:all
           npm run verify:package
           npm run test:packed-guarded-tty
+          npm audit --audit-level=high
           npm audit --omit=dev
       - name: Create immutable checksums
         shell: bash
