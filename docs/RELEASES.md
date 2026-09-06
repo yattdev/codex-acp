@@ -55,8 +55,9 @@ or Windows x64/arm64 runner. Downstream acceptance uses the exact recorded npm
 tarball before publication.
 
 `npm run release:preflight` additionally verifies the open release PR, exact
-version/tag/config, required CI check, repository identity, policy manifest, and
-the presence of the human bootstrap receipt in the protected release process.
+version/tag/config, the core CI job and all six native smoke checks, repository
+identity, policy manifest, and the presence of the human bootstrap receipt in
+the protected release process.
 
 ## Automated release
 
@@ -66,7 +67,7 @@ the `kandev` component. Merging the reviewed release PR creates a
 secretless gates and publishes with the only permitted command. Release Please
 uses the scoped `GITHUB_TOKEN`, so the workflow explicitly dispatches `ci.yml`
 on the release PR branch after creating or updating it. This gives the reviewed
-release commit the same required check without a PAT or GitHub App secret.
+release commit the same required checks without a PAT or GitHub App secret.
 
 The initial configuration contains a one-time `release-as` override for
 `1.7.0-kandev.1`. After Release Please creates that release PR, the workflow

@@ -8,7 +8,15 @@ set -euo pipefail
 EXPECTED_REPO="yattdev/codex-acp"
 EXPECTED_PACKAGE="@yattdev/codex-acp-kandev"
 PENDING_LABEL="autorelease: pending"
-REQUIRED_CHECK="ci"
+REQUIRED_CHECKS=(
+  "ci"
+  "Smoke codex-acp-kandev-x64-linux on ubuntu-24.04"
+  "Smoke codex-acp-kandev-arm64-linux on ubuntu-24.04-arm"
+  "Smoke codex-acp-kandev-x64-darwin on macos-15-intel"
+  "Smoke codex-acp-kandev-arm64-darwin on macos-15"
+  "Smoke codex-acp-kandev-x64-windows on windows-2025"
+  "Smoke codex-acp-kandev-arm64-windows on windows-11-arm"
+)
 
 fail() {
   printf 'FAIL  %s\n' "$1" >&2
@@ -21,6 +29,8 @@ pass() {
 
 command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is not installed."
 gh auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated."
+command -v jq >/dev/null 2>&1 && jq --version >/dev/null 2>&1 ||
+  fail "jq is not installed or executable."
 
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) ||
   fail "cannot resolve the GitHub repository from this checkout."
@@ -82,12 +92,18 @@ gh release view "$expected_tag" --repo "$repo" >/dev/null 2>&1 &&
   fail "release $expected_tag already exists."
 pass "release tag is new and fork-specific: $expected_tag"
 
-build=$(gh pr view "$pr_number" --repo "$repo" --json statusCheckRollup --jq "
-  [.statusCheckRollup[]? | select(.name == \"$REQUIRED_CHECK\")]
-  | if length == 0 then \"MISSING\" else (.[0].conclusion // .[0].status // \"PENDING\") end")
-[ "$build" = "SUCCESS" ] ||
-  fail "required check '$REQUIRED_CHECK' is $build, expected SUCCESS."
-pass "required CI check passed"
+checks=$(gh pr view "$pr_number" --repo "$repo" --json statusCheckRollup)
+for required_check in "${REQUIRED_CHECKS[@]}"; do
+  build=$(jq -r --arg name "$required_check" '
+    [.statusCheckRollup[]? | select(.name == $name)]
+    | if length == 0 then "MISSING"
+      elif all(.[]; .conclusion == "SUCCESS") then "SUCCESS"
+      else map(.conclusion // .status // "PENDING") | join(",")
+      end' <<<"$checks")
+  [ "$build" = "SUCCESS" ] ||
+    fail "required check '$required_check' is $build, expected SUCCESS."
+  pass "required CI check passed: $required_check"
+done
 
 cat <<EOF
 

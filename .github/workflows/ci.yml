@@ -113,14 +113,26 @@ jobs:
         with:
           name: codex-acp-kandev-candidate-${{ github.sha }}
           path: dist/bin
-      - name: Execute the matching packaged CLI
+      - name: Extract the matching packaged CLI on Linux or macOS
+        if: runner.os != 'Windows'
         shell: bash
         env:
           ARCHIVE: ${{ matrix.archive }}
-          BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
           mkdir smoke
-          tar -xf "dist/bin/$ARCHIVE.zip" -C smoke
+          unzip -q "dist/bin/$ARCHIVE.zip" -d smoke
+      - name: Extract the matching packaged CLI on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        run: Expand-Archive -LiteralPath "dist/bin/$env:ARCHIVE.zip" -DestinationPath smoke
+      - name: Execute the matching packaged CLI
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
           chmod +x "smoke/$BINARY"
           "smoke/$BINARY" --version | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'

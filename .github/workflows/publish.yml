@@ -124,11 +124,18 @@ jobs:
           echo "tarball=$candidate_dir/$filename" >> "$GITHUB_OUTPUT"
           echo "integrity=$integrity" >> "$GITHUB_OUTPUT"
           echo "shasum=$shasum" >> "$GITHUB_OUTPUT"
-      - name: Create immutable checksums
+      - name: Verify release archives and create immutable checksums
         shell: bash
         run: |
           set -euo pipefail
-          sha256sum dist/bin/*.zip > dist/bin/SHA256SUMS
+          mapfile -t archives < <(find dist/bin -maxdepth 1 -type f -name 'codex-acp-kandev-*.zip' -print | sort)
+          test "${#archives[@]}" -eq 6
+          for archive in "${archives[@]}"; do
+            unzip -t "$archive"
+          done
+          dist/bin/codex-acp-kandev-x64-linux --version \
+            | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'
+          sha256sum "${archives[@]}" > dist/bin/SHA256SUMS
           sha256sum --check dist/bin/SHA256SUMS
       - name: Attest release archives and checksum manifest
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0

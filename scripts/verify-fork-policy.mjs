@@ -134,6 +134,12 @@ assert(assetUploadIndex < publicationIndex,
     "fallible archive gates must complete before npm publication");
 assert(publishWorkflow.includes("npm run test:packed-guarded-tty"),
     "publication must exercise the installed tarball contract");
+assert(publishWorkflow.includes('test "${#archives[@]}" -eq 6'),
+    "publication must verify all six release archives exist");
+assert(publishWorkflow.includes('unzip -t "$archive"'),
+    "publication must verify each release archive layout");
+assert(publishWorkflow.includes("dist/bin/codex-acp-kandev-x64-linux --version"),
+    "publication must smoke-test the exact native release binary");
 assert(publishWorkflow.includes("npm audit --audit-level=high"),
     "publication must audit build and runtime dependencies");
 assert(publishWorkflow.includes('npm publish "$CANDIDATE_TARBALL" --access public --tag kandev'),
@@ -158,6 +164,12 @@ assert(updateWorkflow.includes("npm audit --audit-level=high"),
 const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
 assert(ciWorkflow.includes("npm audit --audit-level=high"),
     "pull-request CI must audit build and runtime dependencies");
+assert(ciWorkflow.includes('unzip -q "dist/bin/$ARCHIVE.zip" -d smoke'),
+    "Unix native smoke tests must extract ZIP archives with unzip");
+assert(ciWorkflow.includes('Expand-Archive -LiteralPath "dist/bin/$env:ARCHIVE.zip"'),
+    "Windows native smoke tests must extract ZIP archives with Expand-Archive");
+assert(!ciWorkflow.includes('tar -xf "dist/bin/$ARCHIVE.zip"'),
+    "native smoke tests must not pass ZIP archives to tar");
 for (const runner of [
     "ubuntu-24.04",
     "ubuntu-24.04-arm",
@@ -167,6 +179,20 @@ for (const runner of [
     "windows-11-arm",
 ]) {
     assert(ciWorkflow.includes(`os: ${runner}`), `pull-request CI must smoke-test on ${runner}`);
+}
+
+const releasePreflight = readFileSync("scripts/release-preflight.sh", "utf8");
+for (const check of [
+    "ci",
+    "Smoke codex-acp-kandev-x64-linux on ubuntu-24.04",
+    "Smoke codex-acp-kandev-arm64-linux on ubuntu-24.04-arm",
+    "Smoke codex-acp-kandev-x64-darwin on macos-15-intel",
+    "Smoke codex-acp-kandev-arm64-darwin on macos-15",
+    "Smoke codex-acp-kandev-x64-windows on windows-2025",
+    "Smoke codex-acp-kandev-arm64-windows on windows-11-arm",
+]) {
+    assert(releasePreflight.includes(JSON.stringify(check)),
+        `release preflight must require the exact CI check ${check}`);
 }
 
 for (const workflow of ["ci.yml", "e2e.yml", "codex-update.yml", "publish.yml"]) {
