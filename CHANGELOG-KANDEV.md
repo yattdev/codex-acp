@@ -3,6 +3,15 @@
 This changelog covers only the yattdev/Kandev derivative. The inherited
 upstream history remains in [CHANGELOG.md](CHANGELOG.md).
 
+## [1.7.0-kandev.1](https://github.com/yattdev/codex-acp/compare/kandev-v1.7.0-kandev.1...kandev-v1.7.0-kandev.1) (2026-09-06)
+
+
+### Features
+
+* add guarded TTY ACP bridge ([eb871ee](https://github.com/yattdev/codex-acp/commit/eb871ee11fc5b6a33e19e40fc38b60571fdd6247))
+* add maintained Kandev guarded-TTY distribution ([f4df079](https://github.com/yattdev/codex-acp/commit/f4df079f6f6a31e300772f537b14db54136a0ff6))
+* prepare maintained Kandev guarded-TTY distribution ([7c19e87](https://github.com/yattdev/codex-acp/commit/7c19e8777781ed29e463091cb051ace8150d63ba))
+
 ## 1.7.0-kandev.1 (unreleased)
 
 ### Added
