@@ -23,6 +23,33 @@ jobs:
         run: |
           npm ci --include=dev
           npm run verify:fork
+      - name: Audit pinned runtime and release dependencies
+        run: npm audit --audit-level=high
+      - name: Inspect upstream source and published security advisories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_head=$(git ls-remote https://github.com/agentclientprotocol/codex-acp.git refs/heads/main | awk '{print $1}')
+          pinned_base=$(node -p "require('./fork-compatibility.json').upstream.baseCommit")
+          cutoff=$(date -u -d '8 days ago' '+%Y-%m-%dT%H:%M:%SZ')
+          advisories=$(gh api 'repos/agentclientprotocol/codex-acp/security-advisories?per_page=100')
+          recent_high=$(jq --arg cutoff "$cutoff" '[.[] | select((.severity == "high" or .severity == "critical") and .updated_at >= $cutoff)] | length' <<<"$advisories")
+          {
+            echo '## Upstream source and advisory inspection'
+            echo
+            echo "- pinned upstream: \`$pinned_base\`"
+            echo "- current upstream main: \`$upstream_head\`"
+            echo "- high/critical advisories published or updated since \`$cutoff\`: \`$recent_high\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$upstream_head" != "$pinned_base" ]]; then
+            echo '::warning::Upstream source has advanced; the monthly reviewed sync assessment must record whether to stay pinned.'
+          fi
+          if [[ "$recent_high" -gt 0 ]]; then
+            echo '::error::A recent high/critical upstream advisory requires the documented 48-hour risk assessment.'
+            exit 1
+          fi
       - name: Report available Codex and ACP SDK versions
         shell: bash
         run: |

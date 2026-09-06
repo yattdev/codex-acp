@@ -28,16 +28,8 @@ jobs:
           npm test
           npm run build
           npm run verify:package
-      - name: Smoke-test locally packed CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          package_dir=$(mktemp -d)
-          install_dir=$(mktemp -d)
-          npm pack --pack-destination "$package_dir" --ignore-scripts
-          npm install --prefix "$install_dir" --ignore-scripts "$package_dir"/*.tgz
-          "$install_dir/node_modules/.bin/codex-acp-kandev" --version \
-            | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'
+      - name: Exercise the installed tarball against the fake App Server
+        run: npm run test:packed-guarded-tty
 
 # Live-model testing is intentionally not a release gate. This workflow uses
 # the deterministic fake App Server fixtures and requires no repository secret.

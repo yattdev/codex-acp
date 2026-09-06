@@ -138,15 +138,26 @@ export async function executeGuardedTtyExec(
             fail("stale_session");
             return;
         }
+        if (event.capReached) {
+            fail("output_overflow");
+            return;
+        }
+        const remainingBytes = GUARDED_TTY_OUTPUT_BYTES_MAX - stdoutBytes - stderrBytes;
+        const maximumEncodedLength = 4 * Math.ceil(remainingBytes / 3);
+        if (event.deltaBase64.length > maximumEncodedLength) {
+            fail("output_overflow");
+            return;
+        }
         const bytes = decodeBase64(event.deltaBase64);
         if (bytes === null) {
             fail("invalid_output");
             return;
         }
-        if (event.capReached || stdoutBytes + stderrBytes + bytes.length > GUARDED_TTY_OUTPUT_BYTES_MAX) {
+        if (bytes.length > remainingBytes) {
             fail("output_overflow");
             return;
         }
+        if (bytes.length === 0) return;
         if (event.stream === "stdout") {
             stdout.push(bytes);
             stdoutBytes += bytes.length;

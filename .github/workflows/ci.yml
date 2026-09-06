@@ -50,6 +50,8 @@ jobs:
         run: npm run package:all
       - name: Verify npm package allowlist and secret scan
         run: npm run verify:package
+      - name: Exercise the installed tarball against the fake App Server
+        run: npm run test:packed-guarded-tty
       - name: Verify archive inventory and checksums
         shell: bash
         run: |

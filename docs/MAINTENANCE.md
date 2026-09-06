@@ -24,6 +24,12 @@ unrecorded source commits are not compatibility claims.
 * Never automatically merge an upstream or dependency update. Never widen a
   supported range without secretless fork and downstream integration evidence.
 
+The scheduled compatibility job reads upstream `main`, checks published
+upstream advisories updated during the weekly window, audits pinned runtime and
+release dependencies at high severity, and reports current Codex/ACP SDK
+versions. It is read-only and never opens, merges, publishes, or deploys a
+change.
+
 When the upstream version changes, start a new
 `<upstream-version>-kandev.1` line. Changes on the same upstream base
 increment only the final Kandev revision.

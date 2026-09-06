@@ -100,6 +100,31 @@ assert(!publishWorkflow.includes("REGISTRY_UPDATER"), "publish workflow must not
 assert(publishWorkflow.includes("npm publish --access public --tag kandev"), "publish command must select the kandev tag");
 assert(publishWorkflow.includes("id-token: write"), "publish job must request OIDC");
 assert(!/npm\s+publish[^\n]*--tag\s+latest/.test(publishWorkflow), "publish workflow must never select latest");
+assert(!publishWorkflow.includes("--clobber"), "release assets must never be overwritten");
+const attestationIndex = publishWorkflow.indexOf("actions/attest-build-provenance");
+const attestationVerificationIndex = publishWorkflow.indexOf("gh attestation verify");
+const assetUploadIndex = publishWorkflow.indexOf("gh release upload");
+const publicationIndex = publishWorkflow.indexOf("npm publish --access public --tag kandev");
+assert(attestationIndex >= 0 && attestationIndex < attestationVerificationIndex,
+    "release archives must be attested before verification");
+assert(attestationVerificationIndex < assetUploadIndex,
+    "release attestations must be verified before asset upload");
+assert(assetUploadIndex < publicationIndex,
+    "fallible archive gates must complete before npm publication");
+assert(publishWorkflow.includes("npm run test:packed-guarded-tty"),
+    "publication must exercise the installed tarball contract");
+
+const e2eWorkflow = readFileSync(".github/workflows/e2e.yml", "utf8");
+assert(e2eWorkflow.includes("npm run test:packed-guarded-tty"),
+    "packaged acceptance must exercise the installed tarball contract");
+
+const updateWorkflow = readFileSync(".github/workflows/codex-update.yml", "utf8");
+assert(updateWorkflow.includes("git ls-remote https://github.com/agentclientprotocol/codex-acp.git"),
+    "compatibility inspection must read the current upstream source ref");
+assert(updateWorkflow.includes("security-advisories"),
+    "compatibility inspection must query upstream security advisories");
+assert(updateWorkflow.includes("npm audit --audit-level=high"),
+    "compatibility inspection must audit pinned dependencies");
 
 for (const workflow of ["ci.yml", "e2e.yml", "codex-update.yml", "publish.yml"]) {
     const content = readFileSync(`.github/workflows/${workflow}`, "utf8");

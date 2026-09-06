@@ -32,9 +32,9 @@ function installSession(
         ...overrides,
     });
     const agent = fixture.getCodexAcpAgent() as unknown as {
-        sessions: Map<string, SessionState>;
+        installSessionState: (state: SessionState) => void;
     };
-    agent.sessions.set(state.sessionId, state);
+    agent.installSessionState(state);
     return state;
 }
 
@@ -227,6 +227,36 @@ describe("Kandev guarded TTY ACP extension", () => {
         expect(terminate).toHaveBeenCalledOnce();
     });
 
+    it("rejects an oversized encoded delta before attempting to decode it", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const terminate = vi.spyOn(fixture.getCodexAppServerClient(), "commandExecTerminate")
+            .mockResolvedValue({});
+        vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockImplementation(async (params: CommandExecParams) => {
+                fixture.sendServerNotification({
+                    method: "command/exec/outputDelta",
+                    params: {
+                        processId: params.processId!,
+                        stream: "stdout",
+                        deltaBase64: "*".repeat(4 * Math.ceil(GUARDED_TTY_OUTPUT_BYTES_MAX / 3) + 1),
+                        capReached: false,
+                    },
+                });
+                return {exitCode: 0, stdout: "", stderr: ""};
+            });
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["pwd"],
+        })).resolves.toMatchObject({
+            outcome: "failed",
+            denial_code: "output_overflow",
+            output_bytes: 0,
+        });
+        expect(terminate).toHaveBeenCalledOnce();
+    });
+
     it("cancels a dispatched command promptly and ignores its later completion", async () => {
         const fixture = createCodexMockTestFixture();
         installSession(fixture);
@@ -342,6 +372,29 @@ describe("Kandev guarded TTY ACP extension", () => {
         await vi.waitFor(() => expect(fixture.getCodexAppServerClient().commandExec).toHaveBeenCalled());
 
         await fixture.getCodexAcpAgent().closeSession({sessionId: "session-id"});
+        await expect(execution).resolves.toMatchObject({
+            outcome: "failed",
+            denial_code: "stale_session",
+            dispatched_tty: true,
+        });
+        expect(terminate).toHaveBeenCalledOnce();
+    });
+
+    it("aborts an in-flight execution immediately when its session state is replaced", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockReturnValue(new Promise<CommandExecResponse>(() => {}));
+        const terminate = vi.spyOn(fixture.getCodexAppServerClient(), "commandExecTerminate")
+            .mockResolvedValue({});
+        const execution = fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["sh", "-lc", "sleep 30"],
+        });
+        await vi.waitFor(() => expect(fixture.getCodexAppServerClient().commandExec).toHaveBeenCalled());
+
+        installSession(fixture, {cwd: "/trusted/replacement"});
+
         await expect(execution).resolves.toMatchObject({
             outcome: "failed",
             denial_code: "stale_session",

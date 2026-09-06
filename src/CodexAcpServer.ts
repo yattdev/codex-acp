@@ -676,7 +676,7 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
         };
-        this.sessions.set(sessionId, sessionState);
+        this.installSessionState(sessionState);
         resumeSubscribed = false;
 
         const canPublishSessionUpdates = operation !== "fork";
@@ -859,6 +859,11 @@ export class CodexAcpServer {
         for (const execution of executions) {
             execution.abort("stale_session");
         }
+    }
+
+    private installSessionState(sessionState: SessionState): void {
+        this.abortGuardedTtyExecutions(sessionState.sessionId);
+        this.sessions.set(sessionState.sessionId, sessionState);
     }
 
     async deleteSession(params: acp.DeleteSessionRequest): Promise<acp.DeleteSessionResponse> {
@@ -1810,7 +1815,7 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
         };
-        this.sessions.set(sessionId, sessionState);
+        this.installSessionState(sessionState);
         subscribed = false;
 
         if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {

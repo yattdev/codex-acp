@@ -51,6 +51,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit && tsc --noEmit -p examples/tsconfig.json",
     "test:guarded-tty": "vitest run --no-file-parallelism --retry=2 src/__tests__/CodexACPAgent/guarded-tty-exec.test.ts src/__tests__/CodexACPAgent/initialize.test.ts",
+    "test:packed-guarded-tty": "node scripts/test-packed-guarded-tty.mjs",
     "verify:fork": "node scripts/verify-fork-policy.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "codex-test": "tsx .claude/skills/run-codex/scripts/run-codex-test.ts"

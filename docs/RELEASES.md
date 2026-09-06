@@ -39,6 +39,7 @@ npm run build
 npm run bundle:all
 npm run package:all
 npm run verify:package
+npm run test:packed-guarded-tty
 npm audit --omit=dev
 sha256sum dist/bin/*.zip > dist/bin/SHA256SUMS
 npm pack --json --pack-destination "$(mktemp -d)"
@@ -73,9 +74,11 @@ npm publish --access public --tag kandev
 ```
 
 GitHub-hosted npm OIDC supplies the short-lived publishing identity. npm
-provenance is enabled in `package.json`. The workflow builds six archives,
-creates `dist/bin/SHA256SUMS`, attests all seven files, and uploads them to the
-matching GitHub prerelease. There is no deployment or registry dispatch.
+provenance is enabled in `package.json`. Before npm publication, the workflow
+builds six archives, creates `dist/bin/SHA256SUMS`, attests and verifies all
+seven files, and uploads them to the matching GitHub prerelease. Existing assets
+must match byte-for-byte and are never overwritten. There is no deployment or
+registry dispatch.
 
 Verify the immutable result:
 
@@ -106,5 +109,8 @@ publish a new reviewed replacement, and move only `kandev` after verification.
 Never unpublish as a rollback mechanism and never touch `latest`.
 
 If the GitHub release exists but publication or attestation failed, fix the
-underlying gate and rerun the failed job against the same protected tag. Never
-create a different package from an existing tag or reuse an npm version.
+underlying gate and rerun the failed job against the same protected tag. The
+workflow accepts an already-published exact version only so it can repeat the
+registry, signature, and provenance checks; mismatched release assets or npm
+identity still fail closed. Never create a different package from an existing
+tag or reuse an npm version.

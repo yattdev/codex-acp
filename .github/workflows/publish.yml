@@ -105,10 +105,48 @@ jobs:
           npm run bundle:all
           npm run package:all
           npm run verify:package
+          npm run test:packed-guarded-tty
           npm audit --omit=dev
       - name: Create immutable checksums
-        run: sha256sum dist/bin/*.zip > dist/bin/SHA256SUMS
-      - name: Publish with GitHub-hosted npm OIDC
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum dist/bin/*.zip > dist/bin/SHA256SUMS
+          sha256sum --check dist/bin/SHA256SUMS
+      - name: Attest release archives and checksum manifest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            dist/bin/*.zip
+            dist/bin/SHA256SUMS
+      - name: Verify release attestations before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in dist/bin/*.zip dist/bin/SHA256SUMS; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Upload immutable assets to the Kandev prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets)
+          for artifact in dist/bin/*.zip dist/bin/SHA256SUMS; do
+            name=$(basename "$artifact")
+            if jq -e --arg name "$name" '.assets[]? | select(.name == $name)' <<<"$release_assets" >/dev/null; then
+              download_dir=$(mktemp -d)
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir "$download_dir"
+              cmp "$artifact" "$download_dir/$name"
+            else
+              gh release upload "$TAG" "$artifact" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+      - name: Publish or verify the immutable npm version
         env:
           EXPECTED_TAG: ${{ inputs.release_tag }}
         shell: bash
@@ -118,29 +156,23 @@ jobs:
           expected_version=${EXPECTED_TAG#kandev-v}
           [[ "$package_version" == "$expected_version" ]]
           latest_before=$(npm view '@yattdev/codex-acp-kandev' dist-tags.latest 2>/dev/null || true)
-          npm publish --access public --tag kandev
+          if ! npm publish --access public --tag kandev; then
+            existing=$(npm view "@yattdev/codex-acp-kandev@$expected_version" version 2>/dev/null || true)
+            [[ "$existing" == "$expected_version" ]]
+            echo '::notice::The exact immutable npm version already exists; repeating post-publish verification.'
+          fi
           published=$(npm view "@yattdev/codex-acp-kandev@$expected_version" version)
           kandev_tag=$(npm view '@yattdev/codex-acp-kandev' dist-tags.kandev)
           latest_after=$(npm view '@yattdev/codex-acp-kandev' dist-tags.latest 2>/dev/null || true)
           [[ "$published" == "$expected_version" ]]
           [[ "$kandev_tag" == "$expected_version" ]]
           [[ "$latest_after" == "$latest_before" ]]
+          [[ "$latest_after" != "$expected_version" ]]
           verification_dir=$(mktemp -d)
           npm install --prefix "$verification_dir" --ignore-scripts \
             "@yattdev/codex-acp-kandev@$expected_version"
           npm audit signatures --prefix "$verification_dir"
           node scripts/verify-npm-provenance.mjs "$expected_version" "$EXPECTED_TAG"
-      - name: Attest release archives and checksum manifest
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-path: |
-            dist/bin/*.zip
-            dist/bin/SHA256SUMS
-      - name: Upload attested assets to the Kandev prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
-        run: gh release upload "$TAG" dist/bin/*.zip dist/bin/SHA256SUMS --clobber
 
 # The one-time npm scope/package and trusted-publisher binding is Human-owned.
 # This workflow has no token fallback, does not update an upstream registry, and
