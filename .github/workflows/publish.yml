@@ -108,6 +108,22 @@ jobs:
           npm run test:packed-guarded-tty
           npm audit --audit-level=high
           npm audit --omit=dev
+      - name: Build the exact reviewed npm tarball
+        id: npm-candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_dir="$RUNNER_TEMP/npm-candidate"
+          mkdir -p "$candidate_dir"
+          report=$(npm pack --json --ignore-scripts --pack-destination "$candidate_dir")
+          printf '%s\n' "$report" > "$candidate_dir/pack-report.json"
+          filename=$(jq -er '.[0].filename' <<<"$report")
+          integrity=$(jq -er '.[0].integrity' <<<"$report")
+          shasum=$(jq -er '.[0].shasum' <<<"$report")
+          test -f "$candidate_dir/$filename"
+          echo "tarball=$candidate_dir/$filename" >> "$GITHUB_OUTPUT"
+          echo "integrity=$integrity" >> "$GITHUB_OUTPUT"
+          echo "shasum=$shasum" >> "$GITHUB_OUTPUT"
       - name: Create immutable checksums
         shell: bash
         run: |
@@ -150,22 +166,39 @@ jobs:
       - name: Publish or verify the immutable npm version
         env:
           EXPECTED_TAG: ${{ inputs.release_tag }}
+          CANDIDATE_TARBALL: ${{ steps.npm-candidate.outputs.tarball }}
+          EXPECTED_NPM_INTEGRITY: ${{ steps.npm-candidate.outputs.integrity }}
+          EXPECTED_NPM_SHASUM: ${{ steps.npm-candidate.outputs.shasum }}
         shell: bash
         run: |
           set -euo pipefail
           package_version=$(node -p "require('./package.json').version")
           expected_version=${EXPECTED_TAG#kandev-v}
           [[ "$package_version" == "$expected_version" ]]
+          [[ -f "$CANDIDATE_TARBALL" ]]
           latest_before=$(npm view '@yattdev/codex-acp-kandev' dist-tags.latest 2>/dev/null || true)
-          if ! npm publish --access public --tag kandev; then
+          if ! npm publish "$CANDIDATE_TARBALL" --access public --tag kandev; then
             existing=$(npm view "@yattdev/codex-acp-kandev@$expected_version" version 2>/dev/null || true)
             [[ "$existing" == "$expected_version" ]]
             echo '::notice::The exact immutable npm version already exists; repeating post-publish verification.'
           fi
-          published=$(npm view "@yattdev/codex-acp-kandev@$expected_version" version)
+          metadata=''
+          for attempt in {1..12}; do
+            metadata=$(npm view "@yattdev/codex-acp-kandev@$expected_version" version dist --json 2>/dev/null || true)
+            if jq -e '.version and .dist.integrity and .dist.shasum' <<<"$metadata" >/dev/null 2>&1; then
+              break
+            fi
+            metadata=''
+            sleep 5
+          done
+          published=$(jq -er '.version' <<<"$metadata")
+          published_integrity=$(jq -er '.dist.integrity' <<<"$metadata")
+          published_shasum=$(jq -er '.dist.shasum' <<<"$metadata")
           kandev_tag=$(npm view '@yattdev/codex-acp-kandev' dist-tags.kandev)
           latest_after=$(npm view '@yattdev/codex-acp-kandev' dist-tags.latest 2>/dev/null || true)
           [[ "$published" == "$expected_version" ]]
+          [[ "$published_integrity" == "$EXPECTED_NPM_INTEGRITY" ]]
+          [[ "$published_shasum" == "$EXPECTED_NPM_SHASUM" ]]
           [[ "$kandev_tag" == "$expected_version" ]]
           [[ "$latest_after" == "$latest_before" ]]
           [[ "$latest_after" != "$expected_version" ]]

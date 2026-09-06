@@ -14,6 +14,9 @@ upstream history remains in [CHANGELOG.md](CHANGELOG.md).
 * Add a Kandev-owned package identity, exact compatibility manifest,
   maintenance/security policy, secretless CI, npm OIDC provenance, and
   attested binary release gates.
+* Pin the full production dependency graph, produce byte-reproducible ZIPs,
+  smoke-test all six matching hosted targets, and bind registry integrity to
+  the reviewed npm tarball.
 
 ### Provenance
 

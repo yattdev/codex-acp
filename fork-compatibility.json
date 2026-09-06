@@ -33,7 +33,11 @@
   ],
   "runtimeDependencies": {
     "@openai/codex": "0.148.0",
-    "@agentclientprotocol/sdk": "1.4.0"
+    "@agentclientprotocol/sdk": "1.4.0",
+    "diff": "9.0.0",
+    "open": "11.0.1",
+    "vscode-jsonrpc": "9.0.1",
+    "zod": "4.4.3"
   },
   "contract": {
     "capability": "kandev.guarded-tty-exec",

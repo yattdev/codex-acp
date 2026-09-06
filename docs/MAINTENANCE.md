@@ -5,8 +5,9 @@
 Every release supports only the exact envelope in
 `fork-compatibility.json`. The initial line is derived from upstream source
 commit `69ca755d9878238aecf0737c0e4568b3bab37be2`, with Codex `0.148.0`,
-ACP SDK `1.4.0`, and Kandev capability version `1`. Dependency ranges and
-unrecorded source commits are not compatibility claims.
+ACP SDK `1.4.0`, and Kandev capability version `1`. Every production dependency
+uses an exact version and is mirrored in the compatibility manifest; floating
+ranges and unrecorded source commits are rejected before release.
 
 ## Upstream synchronization
 

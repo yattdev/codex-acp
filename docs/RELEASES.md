@@ -43,12 +43,16 @@ npm run test:packed-guarded-tty
 npm audit --audit-level=high
 npm audit --omit=dev
 sha256sum dist/bin/*.zip > dist/bin/SHA256SUMS
-npm pack --json --pack-destination "$(mktemp -d)"
+npm pack --json --ignore-scripts --pack-destination "$(mktemp -d)"
 ```
 
 Record the source commit, `fork-compatibility.json` SHA-256, package filename,
 npm integrity and shasum, archive checksums, Node/npm/Bun versions, and test
-summary. Downstream acceptance uses this exact local tarball before publication.
+summary. `package:all` normalizes executable timestamps and ZIP metadata, so a
+retry of the same commit produces byte-identical archives. CI downloads the
+candidate archives and executes each one on the matching hosted Linux, macOS,
+or Windows x64/arm64 runner. Downstream acceptance uses the exact recorded npm
+tarball before publication.
 
 `npm run release:preflight` additionally verifies the open release PR, exact
 version/tag/config, required CI check, repository identity, policy manifest, and
@@ -71,15 +75,17 @@ therefore leaves no persistent override: later fixes or features advance the
 Kandev prerelease revision instead of attempting to reuse an immutable version.
 
 ```sh
-npm publish --access public --tag kandev
+npm publish "$CANDIDATE_TARBALL" --access public --tag kandev
 ```
 
 GitHub-hosted npm OIDC supplies the short-lived publishing identity. npm
 provenance is enabled in `package.json`. Before npm publication, the workflow
 builds six archives, creates `dist/bin/SHA256SUMS`, attests and verifies all
-seven files, and uploads them to the matching GitHub prerelease. Existing assets
-must match byte-for-byte and are never overwritten. There is no deployment or
-registry dispatch.
+seven files, and uploads them to the matching GitHub prerelease. It then
+publishes the already-built reviewed tarball—not a newly packed directory—and
+requires the registry `dist.integrity` and `dist.shasum` to match the candidate
+on both first publication and retry. Existing assets must match byte-for-byte
+and are never overwritten. There is no deployment or registry dispatch.
 
 Verify the immutable result:
 
@@ -87,7 +93,8 @@ Verify the immutable result:
 npm view '@yattdev/codex-acp-kandev@<version>' name version dist.integrity dist.shasum repository --json
 npm view '@yattdev/codex-acp-kandev' dist-tags --json
 npm audit signatures
-node scripts/verify-npm-provenance.mjs '<version>' 'kandev-v<version>'
+EXPECTED_NPM_INTEGRITY='<candidate-integrity>' EXPECTED_NPM_SHASUM='<candidate-shasum>' \
+  node scripts/verify-npm-provenance.mjs '<version>' 'kandev-v<version>'
 gh release view 'kandev-v<version>' --repo yattdev/codex-acp
 sha256sum --check dist/bin/SHA256SUMS
 gh attestation verify dist/bin/<archive> --repo yattdev/codex-acp

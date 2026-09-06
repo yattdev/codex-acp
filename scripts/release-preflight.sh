@@ -95,7 +95,7 @@ Ready for reviewed merge of #$pr_number.
 
 Expected immutable release: $EXPECTED_PACKAGE@$title_version
 Expected GitHub prerelease: $expected_tag
-Expected npm command:       npm publish --access public --tag kandev
+Expected npm command:       npm publish \"\$CANDIDATE_TARBALL\" --access public --tag kandev
 
 No deployment is performed. The release workflow must stop if OIDC, provenance,
 attestation, environment approval, or post-publish identity verification fails.

@@ -78,3 +78,49 @@ jobs:
             dist/bin/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+  smoke-native:
+    needs: ci
+    name: Smoke ${{ matrix.archive }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            archive: codex-acp-kandev-x64-linux
+            binary: codex-acp-kandev-x64-linux
+          - os: ubuntu-24.04-arm
+            archive: codex-acp-kandev-arm64-linux
+            binary: codex-acp-kandev-arm64-linux
+          - os: macos-15-intel
+            archive: codex-acp-kandev-x64-darwin
+            binary: codex-acp-kandev-x64-darwin
+          - os: macos-15
+            archive: codex-acp-kandev-arm64-darwin
+            binary: codex-acp-kandev-arm64-darwin
+          - os: windows-2025
+            archive: codex-acp-kandev-x64-windows
+            binary: codex-acp-kandev-x64-windows.exe
+          - os: windows-11-arm
+            archive: codex-acp-kandev-arm64-windows
+            binary: codex-acp-kandev-arm64-windows.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-acp-kandev-candidate-${{ github.sha }}
+          path: dist/bin
+      - name: Execute the matching packaged CLI
+        shell: bash
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          mkdir smoke
+          tar -xf "dist/bin/$ARCHIVE.zip" -C smoke
+          chmod +x "smoke/$BINARY"
+          "smoke/$BINARY" --version | grep -Fx '@yattdev/codex-acp-kandev 1.7.0-kandev.1'

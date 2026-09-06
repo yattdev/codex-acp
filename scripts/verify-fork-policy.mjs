@@ -28,6 +28,17 @@ assertEqual(pkg.bin?.[expected.bin], "dist/index.js", "CLI entry point");
 assertEqual(pkg.repository?.url, "git+https://github.com/yattdev/codex-acp.git", "repository URL");
 assertEqual(pkg.dependencies?.["@openai/codex"], "0.148.0", "Codex pin");
 assertEqual(pkg.dependencies?.["@agentclientprotocol/sdk"], "1.4.0", "ACP SDK pin");
+assertEqual(pkg.devDependencies?.["release-please"], "17.6.0", "release-please test pin");
+for (const [name, version] of Object.entries(pkg.dependencies ?? {})) {
+    assert(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version),
+        `runtime dependency ${name} must use an exact version, received ${version}`);
+    assertEqual(compatibility.runtimeDependencies?.[name], version, `manifest runtime dependency ${name}`);
+}
+assertEqual(
+    Object.keys(compatibility.runtimeDependencies ?? {}).sort().join(","),
+    Object.keys(pkg.dependencies ?? {}).sort().join(","),
+    "manifest runtime dependency inventory",
+);
 
 assertEqual(lock.name, pkg.name, "lockfile package name");
 assertEqual(lock.version, pkg.version, "lockfile package version");
@@ -35,6 +46,10 @@ assertEqual(lock.packages?.[""]?.name, pkg.name, "lockfile root package name");
 assertEqual(lock.packages?.[""]?.version, pkg.version, "lockfile root package version");
 assertEqual(lock.packages?.[""]?.dependencies?.["@openai/codex"], "0.148.0", "lockfile Codex pin");
 assertEqual(lock.packages?.[""]?.dependencies?.["@agentclientprotocol/sdk"], "1.4.0", "lockfile ACP SDK pin");
+assertEqual(lock.packages?.[""]?.devDependencies?.["release-please"], "17.6.0", "lockfile release-please test pin");
+for (const [name, version] of Object.entries(pkg.dependencies ?? {})) {
+    assertEqual(lock.packages?.[""]?.dependencies?.[name], version, `lockfile runtime dependency ${name}`);
+}
 
 assertEqual(compatibility.distribution?.package, pkg.name, "compatibility package");
 assertEqual(compatibility.distribution?.version, pkg.version, "compatibility version");
@@ -62,6 +77,11 @@ assertEqual(rootRelease?.["changelog-path"], "CHANGELOG-KANDEV.md", "fork change
 assertEqual(compatibility.contract.version, 1, "guarded-TTY contract version");
 assertEqual(`${rootRelease?.component}-v${pkg.version}`, expected.gitTag, "release tag construction");
 assert(/^\d+\.\d+\.\d+-kandev\.\d+$/.test(pkg.version), "package version must stay on the Kandev prerelease line");
+assertEqual(
+    pkg.version.split("-", 1)[0],
+    compatibility.upstream.nearestReleaseTag?.replace(/^v/, ""),
+    "fork version must match the recorded upstream release base",
+);
 
 if (fixtureRoot) {
     console.log(`Verified maintained-fork metadata fixture for ${pkg.name}@${pkg.version}`);
@@ -97,14 +117,15 @@ const publishWorkflow = readFileSync(".github/workflows/publish.yml", "utf8");
 assert(!publishWorkflow.includes("NPM_TOKEN"), "publish workflow must not use NPM_TOKEN");
 assert(!publishWorkflow.includes("RELEASE_PLZ_APP"), "publish workflow must not use upstream GitHub App secrets");
 assert(!publishWorkflow.includes("REGISTRY_UPDATER"), "publish workflow must not dispatch the upstream registry");
-assert(publishWorkflow.includes("npm publish --access public --tag kandev"), "publish command must select the kandev tag");
+assert(/npm publish (?:"\$CANDIDATE_TARBALL" )?--access public --tag kandev/.test(publishWorkflow),
+    "publish command must select the kandev tag");
 assert(publishWorkflow.includes("id-token: write"), "publish job must request OIDC");
 assert(!/npm\s+publish[^\n]*--tag\s+latest/.test(publishWorkflow), "publish workflow must never select latest");
 assert(!publishWorkflow.includes("--clobber"), "release assets must never be overwritten");
 const attestationIndex = publishWorkflow.indexOf("actions/attest-build-provenance");
 const attestationVerificationIndex = publishWorkflow.indexOf("gh attestation verify");
 const assetUploadIndex = publishWorkflow.indexOf("gh release upload");
-const publicationIndex = publishWorkflow.indexOf("npm publish --access public --tag kandev");
+const publicationIndex = publishWorkflow.indexOf('npm publish "$CANDIDATE_TARBALL" --access public --tag kandev');
 assert(attestationIndex >= 0 && attestationIndex < attestationVerificationIndex,
     "release archives must be attested before verification");
 assert(attestationVerificationIndex < assetUploadIndex,
@@ -115,6 +136,12 @@ assert(publishWorkflow.includes("npm run test:packed-guarded-tty"),
     "publication must exercise the installed tarball contract");
 assert(publishWorkflow.includes("npm audit --audit-level=high"),
     "publication must audit build and runtime dependencies");
+assert(publishWorkflow.includes('npm publish "$CANDIDATE_TARBALL" --access public --tag kandev'),
+    "publication must publish the exact reviewed tarball");
+assert(publishWorkflow.includes('[[ "$published_integrity" == "$EXPECTED_NPM_INTEGRITY" ]]'),
+    "publication must verify registry integrity against the reviewed tarball");
+assert(publishWorkflow.includes('[[ "$published_shasum" == "$EXPECTED_NPM_SHASUM" ]]'),
+    "publication must verify registry shasum against the reviewed tarball");
 
 const e2eWorkflow = readFileSync(".github/workflows/e2e.yml", "utf8");
 assert(e2eWorkflow.includes("npm run test:packed-guarded-tty"),
@@ -131,6 +158,16 @@ assert(updateWorkflow.includes("npm audit --audit-level=high"),
 const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
 assert(ciWorkflow.includes("npm audit --audit-level=high"),
     "pull-request CI must audit build and runtime dependencies");
+for (const runner of [
+    "ubuntu-24.04",
+    "ubuntu-24.04-arm",
+    "macos-15-intel",
+    "macos-15",
+    "windows-2025",
+    "windows-11-arm",
+]) {
+    assert(ciWorkflow.includes(`os: ${runner}`), `pull-request CI must smoke-test on ${runner}`);
+}
 
 for (const workflow of ["ci.yml", "e2e.yml", "codex-update.yml", "publish.yml"]) {
     const content = readFileSync(`.github/workflows/${workflow}`, "utf8");

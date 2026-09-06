@@ -7,6 +7,8 @@ const tag = process.argv[3] ?? `kandev-v${version}`;
 const packageId = `pkg:npm/%40yattdev/codex-acp-kandev@${version}`;
 const expectedRef = `refs/tags/${tag}`;
 const expectedCommit = execFileSync("git", ["rev-parse", "HEAD"], {encoding: "utf8"}).trim();
+const expectedIntegrity = process.env["EXPECTED_NPM_INTEGRITY"];
+const expectedShasum = process.env["EXPECTED_NPM_SHASUM"];
 
 assert(pkg.name === "@yattdev/codex-acp-kandev", `unexpected package ${pkg.name}`);
 assert(version === pkg.version, `expected package version ${pkg.version}, received ${version}`);
@@ -17,6 +19,12 @@ const metadata = await fetchJsonWithRetry(
     metadataUrl,
     (value) => typeof value.dist?.attestations?.url === "string",
 );
+assert(typeof expectedIntegrity === "string" && expectedIntegrity.length > 0,
+    "EXPECTED_NPM_INTEGRITY is required");
+assert(typeof expectedShasum === "string" && expectedShasum.length > 0,
+    "EXPECTED_NPM_SHASUM is required");
+assert(metadata.dist?.integrity === expectedIntegrity, "published npm integrity differs from the reviewed tarball");
+assert(metadata.dist?.shasum === expectedShasum, "published npm shasum differs from the reviewed tarball");
 const attestationsUrl = metadata.dist?.attestations?.url;
 assert(typeof attestationsUrl === "string", "published package is missing npm attestations");
 const document = await fetchJsonWithRetry(

@@ -99,6 +99,20 @@ describe("Kandev guarded TTY ACP extension", () => {
         })).rejects.toThrow("Unknown or stale session");
     });
 
+    it("fails closed when a previously active capability session is closed", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const commandExec = vi.spyOn(fixture.getCodexAppServerClient(), "commandExec");
+        vi.spyOn(fixture.getCodexAcpClient(), "closeSession").mockResolvedValue();
+
+        await fixture.getCodexAcpAgent().closeSession({sessionId: "session-id"});
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_CAPABILITY_METHOD, {
+            sessionId: "session-id",
+        })).rejects.toThrow("Unknown or stale session");
+        expect(commandExec).not.toHaveBeenCalled();
+    });
+
     it("rejects empty, oversized, malformed, and security-field requests before dispatch", async () => {
         const fixture = createCodexMockTestFixture();
         installSession(fixture);
@@ -151,6 +165,23 @@ describe("Kandev guarded TTY ACP extension", () => {
         expect(commandExec).toHaveBeenCalledOnce();
     });
 
+    it("accepts exactly 64 non-empty arguments and rejects the 65th", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const commandExec = vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockResolvedValue({exitCode: 0, stdout: "", stderr: ""});
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: Array.from({length: 64}, (_, index) => `a${index}`),
+        })).resolves.toMatchObject({outcome: "completed"});
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: Array.from({length: 65}, () => "x"),
+        })).rejects.toThrow(RequestError);
+        expect(commandExec).toHaveBeenCalledOnce();
+    });
+
     it("dispatches tty:true with a generated id and trusted session execution state", async () => {
         const fixture = createCodexMockTestFixture();
         const state = installSession(fixture);
@@ -198,6 +229,9 @@ describe("Kandev guarded TTY ACP extension", () => {
             denial_code: null,
             stdout: "TTY ✅\n",
             stderr: "stty ok\n",
+            stdout_bytes: 8,
+            stderr_bytes: 8,
+            output_bytes: 16,
             exit_code: 0,
         });
         expect(process.env["CODEX_CONFIG"]).toBe(configBefore);
@@ -222,6 +256,34 @@ describe("Kandev guarded TTY ACP extension", () => {
             denial_code: "output_overflow",
             stdout: "",
             output_bytes: 0,
+            exit_code: null,
+        });
+        expect(terminate).toHaveBeenCalledOnce();
+    });
+
+    it("bounds cumulative stdout and stderr across multiple deltas", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const terminate = vi.spyOn(fixture.getCodexAppServerClient(), "commandExecTerminate")
+            .mockResolvedValue({});
+        vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockImplementation(async (params: CommandExecParams) => {
+                const half = Buffer.alloc(GUARDED_TTY_OUTPUT_BYTES_MAX / 2, "a");
+                fixture.sendServerNotification(outputDelta(params.processId!, "stdout", half));
+                fixture.sendServerNotification(outputDelta(params.processId!, "stderr", half));
+                fixture.sendServerNotification(outputDelta(params.processId!, "stdout", Buffer.from("overflow")));
+                return {exitCode: 0, stdout: "", stderr: ""};
+            });
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["yes"],
+        })).resolves.toMatchObject({
+            outcome: "failed",
+            denial_code: "output_overflow",
+            stdout_bytes: GUARDED_TTY_OUTPUT_BYTES_MAX / 2,
+            stderr_bytes: GUARDED_TTY_OUTPUT_BYTES_MAX / 2,
+            output_bytes: GUARDED_TTY_OUTPUT_BYTES_MAX,
             exit_code: null,
         });
         expect(terminate).toHaveBeenCalledOnce();
@@ -429,6 +491,82 @@ describe("Kandev guarded TTY ACP extension", () => {
         expect(appServerFailure).toMatchObject({denial_code: "app_server_error"});
         expect(JSON.stringify(appServerFailure)).not.toContain("secret-bearing");
         expect(terminate).toHaveBeenCalledTimes(2);
+    });
+
+    it("returns a stable failure when the App Server transport disconnects", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const terminate = vi.spyOn(fixture.getCodexAppServerClient(), "commandExecTerminate")
+            .mockRejectedValue(new Error("transport is already disconnected: secret detail"));
+        vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockRejectedValue(new Error("transport disconnected: secret detail"));
+
+        const receipt = await fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["pwd"],
+        });
+
+        expect(receipt).toMatchObject({
+            outcome: "failed",
+            denial_code: "app_server_error",
+            dispatched_tty: true,
+            exit_code: null,
+        });
+        expect(JSON.stringify(receipt)).not.toContain("secret detail");
+        expect(terminate).toHaveBeenCalledOnce();
+    });
+
+    it("does not leak or replace the terminal receipt when termination is rejected", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const terminate = vi.spyOn(fixture.getCodexAppServerClient(), "commandExecTerminate")
+            .mockRejectedValue(new Error("secret termination rejection"));
+        vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockImplementation(async (params: CommandExecParams) => {
+                fixture.sendServerNotification(outputDelta(params.processId!, "stdout", Buffer.from("bounded"), true));
+                return {exitCode: 99, stdout: "", stderr: ""};
+            });
+
+        const receipt = await fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["yes"],
+        });
+
+        expect(receipt).toMatchObject({
+            outcome: "failed",
+            denial_code: "output_overflow",
+            stdout: "",
+            output_bytes: 0,
+            exit_code: null,
+        });
+        expect(JSON.stringify(receipt)).not.toContain("secret termination rejection");
+        expect(terminate).toHaveBeenCalledOnce();
+    });
+
+    it("keeps the first command completion when a broken transport completes twice", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const duplicateCompletion = {
+            then(
+                fulfilled: (value: CommandExecResponse) => void,
+                _rejected: (reason: unknown) => void,
+            ) {
+                fulfilled({exitCode: 0, stdout: "", stderr: ""});
+                fulfilled({exitCode: 99, stdout: "", stderr: ""});
+                return Promise.resolve();
+            },
+        } as unknown as Promise<CommandExecResponse>;
+        vi.spyOn(fixture.getCodexAppServerClient(), "commandExec").mockReturnValue(duplicateCompletion);
+        const terminate = vi.spyOn(fixture.getCodexAppServerClient(), "commandExecTerminate");
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["true"],
+        })).resolves.toMatchObject({
+            outcome: "completed",
+            exit_code: 0,
+        });
+        expect(terminate).not.toHaveBeenCalled();
     });
 
     it("terminates a command that outlives the fixed bridge deadline", async () => {
