@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "distribution": {
+    "package": "@yattdev/codex-acp-kandev",
+    "version": "1.7.0-kandev.1",
+    "distTag": "kandev",
+    "bin": "codex-acp-kandev",
+    "gitTag": "kandev-v1.7.0-kandev.1",
+    "publishWorkflow": ".github/workflows/publish.yml",
+    "supported": true,
+    "rollbackPredecessor": null
+  },
+  "upstream": {
+    "repository": "https://github.com/agentclientprotocol/codex-acp.git",
+    "baseCommit": "69ca755d9878238aecf0737c0e4568b3bab37be2",
+    "minimumCommit": "69ca755d9878238aecf0737c0e4568b3bab37be2",
+    "maximumCommit": "69ca755d9878238aecf0737c0e4568b3bab37be2",
+    "nearestReleaseTag": "v1.7.0",
+    "nearestReleaseCommit": "2b48e9822330fc09f3a94a81563e5c4bb779601a",
+    "appServerTypesTree": "ed0ba2ee1655e2139433fc8777f3ccd3508c1555"
+  },
+  "imports": [
+    {
+      "sourceCommit": "22c17a27676cff894ef45ec2f5f8d83fcf31dc22",
+      "importedCommit": "eb871ee11fc5b6a33e19e40fc38b60571fdd6247",
+      "patchId": "06ea919471feb7511de7b3adde69cb76a22619c7"
+    },
+    {
+      "sourceCommit": "1a5d8b9cf1f70a8677ead500088a8e022cdc65bb",
+      "importedCommit": "fa1b07764bb4662785556d763a49a8d97fed8dc1",
+      "patchId": "a19d7d70954ff6046a6bb8112d335ead1e6a9539"
+    }
+  ],
+  "runtimeDependencies": {
+    "@openai/codex": "0.148.0",
+    "@agentclientprotocol/sdk": "1.4.0"
+  },
+  "contract": {
+    "capability": "kandev.guarded-tty-exec",
+    "version": 1,
+    "capabilityMethod": "_kandev/guarded_tty/capability",
+    "execMethod": "_kandev/guarded_tty/exec"
+  }
+}

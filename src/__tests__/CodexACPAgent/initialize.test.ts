@@ -40,7 +40,7 @@ describe('CodexACPAgent - initialize', () => {
             protocolVersion: acp.PROTOCOL_VERSION,
             agentInfo: {
                 name: packageJson.name,
-                title: "Codex",
+                title: "Kandev Codex ACP",
                 version: packageJson.version,
             },
             agentCapabilities: {

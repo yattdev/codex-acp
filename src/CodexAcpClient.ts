@@ -132,7 +132,7 @@ export class CodexAcpClient {
     }
 
     private readonly defaultClientInfo: ClientInfo = {
-        name: `${packageJson.name}`, title: "Codex ACP", version: `${packageJson.version}`
+        name: `${packageJson.name}`, title: "Kandev Codex ACP", version: `${packageJson.version}`
     };
 
     async initialize(request: acp.InitializeRequest): Promise<void> {

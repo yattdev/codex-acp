@@ -8,7 +8,7 @@ import {
     KANDEV_GUARDED_TTY_VERSION,
 } from "../../AcpExtensions";
 import {GUARDED_TTY_OUTPUT_BYTES_MAX, GUARDED_TTY_TIMEOUT_MS} from "../../GuardedTtyExec";
-import {createCodexMockTestFixture, createTestSessionState} from "../acp-test-utils";
+import {createCodexMockTestFixture, createTestSessionState, setupPromptAndSendNotifications} from "../acp-test-utils";
 import type {CodexMockTestFixture} from "../acp-test-utils";
 import type {SessionState} from "../../CodexAcpServer";
 import type {CommandExecParams, CommandExecResponse} from "../../app-server/v2";
@@ -131,6 +131,26 @@ describe("Kandev guarded TTY ACP extension", () => {
         expect(commandExec).not.toHaveBeenCalled();
     });
 
+    it("enforces aggregate argv limits in UTF-8 bytes at the exact boundary", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const commandExec = vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockResolvedValue({exitCode: 0, stdout: "", stderr: ""});
+        const fourKiB = "é".repeat(2 * 1024);
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: [fourKiB, fourKiB],
+        })).resolves.toMatchObject({outcome: "completed"});
+        expect(commandExec).toHaveBeenCalledOnce();
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: [fourKiB, fourKiB, "é"],
+        })).rejects.toThrow(RequestError);
+        expect(commandExec).toHaveBeenCalledOnce();
+    });
+
     it("dispatches tty:true with a generated id and trusted session execution state", async () => {
         const fixture = createCodexMockTestFixture();
         const state = installSession(fixture);
@@ -230,6 +250,81 @@ describe("Kandev guarded TTY ACP extension", () => {
         });
         expect(terminate).toHaveBeenCalledOnce();
         response.resolve({exitCode: 0, stdout: "", stderr: ""});
+    });
+
+    it("ignores duplicate cancellation and output arriving after completion", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        const response = deferred<CommandExecResponse>();
+        const commandExec = vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockReturnValue(response.promise);
+        const terminate = vi.spyOn(fixture.getCodexAppServerClient(), "commandExecTerminate")
+            .mockResolvedValue({});
+        const controller = new AbortController();
+        const execution = fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["printf", "done"],
+        }, controller.signal);
+        await vi.waitFor(() => expect(commandExec).toHaveBeenCalledOnce());
+        const processId = commandExec.mock.calls[0]![0].processId!;
+        fixture.sendServerNotification(outputDelta(processId, "stdout", Buffer.from("done")));
+        response.resolve({exitCode: 0, stdout: "", stderr: ""});
+
+        const receipt = await execution;
+        controller.abort();
+        controller.abort();
+        fixture.sendServerNotification(outputDelta(processId, "stdout", Buffer.from("late")));
+
+        expect(receipt).toMatchObject({
+            outcome: "completed",
+            stdout: "done",
+            output_bytes: 4,
+            exit_code: 0,
+        });
+        expect(terminate).not.toHaveBeenCalled();
+    });
+
+    it("keeps ordinary non-TTY event delivery prompt while guarded execution is pending", async () => {
+        const fixture = createCodexMockTestFixture();
+        const state = installSession(fixture);
+        const response = deferred<CommandExecResponse>();
+        const commandExec = vi.spyOn(fixture.getCodexAppServerClient(), "commandExec")
+            .mockReturnValue(response.promise);
+        const execution = fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["sh", "-lc", "sleep 1"],
+        });
+        await vi.waitFor(() => expect(commandExec).toHaveBeenCalledOnce());
+
+        await setupPromptAndSendNotifications(fixture, "session-id", state, [{
+            method: "item/started",
+            params: {
+                threadId: "session-id",
+                turnId: "turn-ordinary",
+                startedAtMs: 0,
+                item: {
+                    type: "commandExecution",
+                    id: "ordinary-command",
+                    pluginId: null,
+                    scriptPath: null,
+                    command: "git status --short",
+                    cwd: "/trusted/task/worktree",
+                    processId: null,
+                    source: "agent",
+                    status: "inProgress",
+                    commandActions: [],
+                    aggregatedOutput: null,
+                    exitCode: null,
+                    durationMs: null,
+                },
+            },
+        }]);
+
+        expect(fixture.getAcpConnectionEvents([])).toEqual(expect.arrayContaining([
+            expect.objectContaining({method: "sessionUpdate"}),
+        ]));
+        response.resolve({exitCode: 0, stdout: "", stderr: ""});
+        await expect(execution).resolves.toMatchObject({outcome: "completed"});
     });
 
     it("aborts an in-flight execution when its session closes", async () => {

@@ -1,20 +1,13 @@
 #!/usr/bin/env bash
-#
-# Preflight checks for a release.
-#
-# release-please decides what the next version is; this script only verifies the
-# repository is in a state where merging the open release PR produces a correct
-# release. Merging main needs no review, so these checks are the only thing
-# standing between a mistake and a published package — keep them as code rather
-# than as a list someone has to remember. See docs/RELEASES.md.
-#
-# Requires an authenticated GitHub CLI. Nothing else: gh has a jq engine builtin.
+
+# Validate the reviewed Kandev prerelease before its release PR is merged.
+# This script never publishes, creates a release, or mutates registry state.
 
 set -euo pipefail
 
+EXPECTED_REPO="yattdev/codex-acp"
+EXPECTED_PACKAGE="@yattdev/codex-acp-kandev"
 PENDING_LABEL="autorelease: pending"
-# The check that must be green on the release PR. This is the job id in
-# ci.yml; e2e tests do not run on pull requests, so they are not checked here.
 REQUIRED_CHECK="ci"
 
 fail() {
@@ -26,102 +19,84 @@ pass() {
   printf 'ok    %s\n' "$1"
 }
 
-command -v gh >/dev/null 2>&1 ||
-  fail "GitHub CLI (gh) is not installed."
-gh auth status >/dev/null 2>&1 ||
-  fail "GitHub CLI is not authenticated. Run 'gh auth login'."
+command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is not installed."
+gh auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated."
 
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) ||
-  fail "cannot work out which GitHub repository this is. Run from a checkout."
+  fail "cannot resolve the GitHub repository from this checkout."
+[ "$repo" = "$EXPECTED_REPO" ] ||
+  fail "release preflight is restricted to $EXPECTED_REPO, received $repo."
+pass "repository identity is $EXPECTED_REPO"
 
-# A merged release PR that still carries the pending label means release-please
-# never tagged it. In that state it refuses to open any new release PR at all,
-# so every later release stalls silently until it is recovered by hand.
-stuck=$(gh pr list --repo "$repo" --state merged --label "$PENDING_LABEL" \
-  --json number --jq 'map("#\(.number)") | join(", ")')
-[ -z "$stuck" ] ||
-  fail "merged release PR still labelled '$PENDING_LABEL': $stuck.
-      release-please is jammed and will not open new release PRs.
-      See docs/RELEASES.md, 'Recovering a stalled release'."
-pass "no untagged merged release PR"
+npm run verify:fork
+pass "fork metadata, provenance, compatibility, and workflow policy agree"
+
+if [ -z "${KANDEV_NPM_BOOTSTRAP_RECEIPT_SHA256:-}" ]; then
+  fail "the Human-owned npm trusted-publisher bootstrap receipt digest is absent.
+      Set KANDEV_NPM_BOOTSTRAP_RECEIPT_SHA256 to the redacted receipt SHA-256
+      only after the yattdev owner has completed and reviewed the setup."
+fi
+[[ "$KANDEV_NPM_BOOTSTRAP_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  fail "bootstrap receipt must be exactly 64 lowercase hexadecimal characters."
+pass "Human-owned bootstrap receipt digest is present"
+
+gh api "repos/$repo/environments/release" >/dev/null 2>&1 ||
+  fail "protected GitHub environment 'release' is not configured."
+pass "release environment exists"
 
 rows=$(gh pr list --repo "$repo" --state open --label "$PENDING_LABEL" \
   --json number,title,headRefName --jq '.[] | [.number, .headRefName, .title] | @tsv')
 count=$(printf '%s\n' "$rows" | grep -c . || true)
-
-if [ "$count" -eq 0 ]; then
-  fail "no open release PR.
-      Nothing has landed since the last tag that release-please puts in a
-      changelog, so there is nothing to release. Land a feat/fix/perf/revert
-      change first, or check that the Publish and Release workflow is running."
-fi
-if [ "$count" -gt 1 ]; then
-  fail "$count open release PRs, expected exactly one:
-$rows"
-fi
+[ "$count" -eq 1 ] || fail "expected one open '$PENDING_LABEL' PR, received $count."
 IFS=$(printf '\t') read -r pr_number head_ref pr_title <<EOF
 $rows
 EOF
 pass "one open release PR: #$pr_number ($pr_title)"
 
-# release-please reads the version to tag from the PR title, while npm publishes
-# whatever package.json says. If those disagree the tag and the published package
-# describe different releases, so check all three sources against each other.
-# The version is the last field, not everything after 'release': release-please
-# writes the component into the title as 'release <component> X.Y.Z' whenever it
-# is configured to tag with one.
 title_version=${pr_title##* }
-case $title_version in
-[0-9]*.[0-9]*.[0-9]*) ;;
-*) fail "cannot read a version from PR title '$pr_title'." ;;
+case "$title_version" in
+  [0-9]*.[0-9]*.[0-9]*-kandev.[0-9]*) ;;
+  *) fail "release PR title does not end in a Kandev prerelease version: $pr_title" ;;
 esac
+
+pkg_name=$(gh api "repos/$repo/contents/package.json?ref=$head_ref" \
+  -H "Accept: application/vnd.github.raw" --jq .name)
 pkg_version=$(gh api "repos/$repo/contents/package.json?ref=$head_ref" \
   -H "Accept: application/vnd.github.raw" --jq .version)
 manifest_version=$(gh api "repos/$repo/contents/.release-please-manifest.json?ref=$head_ref" \
   -H "Accept: application/vnd.github.raw" --jq '."."')
 
-if [ "$title_version" != "$pkg_version" ] || [ "$title_version" != "$manifest_version" ]; then
-  fail "version mismatch on #$pr_number:
-      PR title                      $title_version
-      package.json                  $pkg_version
-      .release-please-manifest.json $manifest_version"
-fi
-pass "version agrees across PR title, package.json and manifest: $title_version"
+[ "$pkg_name" = "$EXPECTED_PACKAGE" ] || fail "release PR package is $pkg_name."
+[ "$title_version" = "$pkg_version" ] || fail "PR/package version mismatch."
+[ "$title_version" = "$manifest_version" ] || fail "PR/manifest version mismatch."
+pass "package and version identity agree: $EXPECTED_PACKAGE@$title_version"
 
-# The tag comes from the config, not from the PR title. With
-# include-component-in-tag left on, release-please tags <component>-vX.Y.Z, which
-# breaks the vX.Y.Z scheme the rest of this script and docs/RELEASES.md rely on,
-# and makes it rewrite the whole history into the changelog because no tag under
-# that scheme exists yet. The compare link it writes into the PR body names the
-# tags it is going to use, so check those rather than trusting the config.
+expected_tag="kandev-v$title_version"
 compare_tag=$(gh pr view "$pr_number" --repo "$repo" --json body --jq '
   .body | capture("/compare/[^)]*[.][.][.](?<to>[^)\\s]+)").to // ""' 2>/dev/null || true)
-case $compare_tag in
-"" | "v$title_version") ;;
-*) fail "release-please is going to tag '$compare_tag', not 'v$title_version'.
-      Every previous release is tagged vX.Y.Z, and the changelog for #$pr_number
-      covers the whole history rather than just this release, because no tag
-      under that scheme exists. Set 'include-component-in-tag': false in
-      release-please-config.json, then let it rewrite the release PR." ;;
+case "$compare_tag" in
+  "" | "$expected_tag") ;;
+  *) fail "release-please proposes tag '$compare_tag', expected '$expected_tag'." ;;
 esac
-
-if gh release view "v$title_version" --repo "$repo" >/dev/null 2>&1; then
-  fail "tag v$title_version already exists. Merging would try to release it twice."
-fi
-pass "tag v$title_version does not exist yet"
+gh release view "$expected_tag" --repo "$repo" >/dev/null 2>&1 &&
+  fail "release $expected_tag already exists."
+pass "release tag is new and fork-specific: $expected_tag"
 
 build=$(gh pr view "$pr_number" --repo "$repo" --json statusCheckRollup --jq "
   [.statusCheckRollup[]? | select(.name == \"$REQUIRED_CHECK\")]
   | if length == 0 then \"MISSING\" else (.[0].conclusion // .[0].status // \"PENDING\") end")
 [ "$build" = "SUCCESS" ] ||
-  fail "required check '$REQUIRED_CHECK' is $build on #$pr_number, expected SUCCESS."
-pass "required check '$REQUIRED_CHECK' passed"
+  fail "required check '$REQUIRED_CHECK' is $build, expected SUCCESS."
+pass "required CI check passed"
 
 cat <<EOF
 
-Ready to release $title_version.
+Ready for reviewed merge of #$pr_number.
 
-  gh pr merge $pr_number --squash
+Expected immutable release: $EXPECTED_PACKAGE@$title_version
+Expected GitHub prerelease: $expected_tag
+Expected npm command:       npm publish --access public --tag kandev
 
-Merging tags v$title_version, publishes to npm and updates the agent registry.
+No deployment is performed. The release workflow must stop if OIDC, provenance,
+attestation, environment approval, or post-publish identity verification fails.
 EOF
