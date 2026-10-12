@@ -76,22 +76,40 @@ describe('CodexACPAgent - initialize', () => {
                 steering: {
                     supported: true,
                 },
-                goal: {
-                    version: 1,
-                    controlMethod: "_session/goal",
-                    actions: ["set", "pause", "resume", "clear"],
-                },
                 guardedTtyExec: {
                     capability: KANDEV_GUARDED_TTY_CAPABILITY,
                     version: KANDEV_GUARDED_TTY_VERSION,
                     capabilityMethod: KANDEV_GUARDED_TTY_CAPABILITY_METHOD,
                     execMethod: KANDEV_GUARDED_TTY_EXEC_METHOD,
                 },
-                jetbrains: {
-                    air: {
+            },
+        });
+    });
+
+    it('should advertise the AIR extension only to AIR', async () => {
+        const result = await agent.initialize({
+            protocolVersion: acp.PROTOCOL_VERSION,
+            clientCapabilities: {_meta: {jetbrains: {air: {version: 1, capabilities: []}}}},
+        });
+        expect(result._meta).toEqual({
+            steering: {
+                supported: true,
+            },
+            guardedTtyExec: {
+                capability: KANDEV_GUARDED_TTY_CAPABILITY,
+                version: KANDEV_GUARDED_TTY_VERSION,
+                capabilityMethod: KANDEV_GUARDED_TTY_CAPABILITY_METHOD,
+                execMethod: KANDEV_GUARDED_TTY_EXEC_METHOD,
+            },
+            jetbrains: {
+                air: {
+                    version: 1,
+                    goal: {
                         version: 1,
-                        capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions", "asyncTasks", "recommendedValue"],
+                        controlMethod: "_session/goal",
+                        actions: ["set", "pause", "resume", "clear"],
                     },
+                    capabilities: ["sessionFailure", "diffPatch", "agentFileChangeReport", "customInstructions", "nativeSubagentSessions", "asyncTasks", "recommendedValue", "rawInputRendering", "planContentDelta", "codexHooks"],
                 },
             },
         });

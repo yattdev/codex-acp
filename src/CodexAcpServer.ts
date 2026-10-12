@@ -1,16 +1,14 @@
 import * as acp from "@agentclientprotocol/sdk";
 import {RequestError, type SessionId, type SessionModeState} from "@agentclientprotocol/sdk";
 import {CodexEventHandler, type CompletedPlan} from "./CodexEventHandler";
+import {attachmentFileUri, desktopAttachmentHistory} from "./DesktopAttachmentHistory";
 import {CodexApprovalHandler} from "./permissions/CodexApprovalHandler";
 import {PermissionLifecycleContext} from "./permissions/lifecycle";
-import {
-    planImplementationApproved,
-    planImplementationPermissionRequest,
-    planImplementationToolCallId,
-} from "./permissions/plan-review";
 import {CodexElicitationHandler} from "./CodexElicitationHandler";
 import {type CodexAuthRequest, getCodexAuthMethods, isCodexAuthRequest} from "./CodexAuthMethod";
 import {clientSupportsUrlElicitation} from "./ElicitationCapabilities";
+import {createMcpServerSignIn, type McpServerSignIn} from "./mcp/McpServerSignIn";
+import {getRequestedMcpServerNames, McpSessionStartup, parseMcpStartupAwaitTimeoutMs} from "./mcp/McpSessionStartup";
 import {
     CodexAcpClient,
     type JsonObject,
@@ -19,14 +17,30 @@ import {
     type SessionMetadataWithThread,
     type UrlElicitationRequester
 } from "./CodexAcpClient";
-import {CodexAppServerClient, type McpStartupResult} from "./CodexAppServerClient";
-import {isNoActiveTurnError} from "./CodexThreadErrors";
-import {type CodexConnection, startCodexConnection} from "./CodexJsonRpcConnection";
+import {CodexAppServerClient} from "./CodexAppServerClient";
+import {
+    isAccountReadAccountChangedError,
+    isAccountReadAuthFailureError,
+    isAccountReadUnavailableError,
+    isNoActiveTurnError,
+} from "./CodexThreadErrors";
+import {type CodexConnection} from "./CodexJsonRpcConnection";
+import {AppServerRecovery, recoveryLimitsFromEnv} from "./app-server-recovery/AppServerRecovery";
+import {
+    CODEX_PROCESS_EXITED_ERROR_CODE,
+    SessionReplacedError,
+    ThreadRefusedError,
+    UnpersistedSessionLostError,
+} from "./app-server-recovery/AppServerExit";
+import {CodexAppServerSupervisor} from "./app-server-recovery/CodexAppServerSupervisor";
+import {lossAwareConnection} from "./app-server-recovery/LossAwareConnection";
+import {AppServerConnectionLostError} from "./app-server-recovery/ConnectionLoss";
 import {type AcpClientConnection, ACPSessionConnection, type UpdateSessionEvent} from "./ACPSessionConnection";
 import type {InputModality, ReasoningEffort, ServerNotification} from "./app-server";
 import type {
     Account,
     AccountUpdatedNotification,
+    GetAccountResponse,
     Model,
     ReasoningEffortOption,
     Thread,
@@ -36,6 +50,7 @@ import type {
 } from "./app-server/v2";
 import type {RateLimitsMap} from "./RateLimitsMap";
 import {ModelId} from "./ModelId";
+import {normalizeSessionTitle} from "./SessionTitle";
 import {AgentMode, MODE_CONFIG_ID} from "./AgentMode";
 import {
     COLLABORATION_MODE_CONFIG_ID,
@@ -54,18 +69,20 @@ import {
     REASONING_EFFORT_CONFIG_ID,
 } from "./ModelConfigOption";
 import type {TokenCount} from "./TokenCount";
-import {toPromptUsage} from "./TokenCount";
+import {PromptTokenUsage, toPromptUsage, ZERO_TOKEN_COUNT} from "./TokenCount";
 import {CodexCommands, GOAL_CONTINUATION_PROMPT} from "./CodexCommands";
 import {SteeringQueue} from "./SteeringQueue";
 import type {QuotaMeta} from "./QuotaMeta";
 import {logger} from "./Logger";
-import {sanitizeMcpServerName} from "./McpServerName";
-import {createResponseItemHistoryFallbackUpdates} from "./ResponseItemHistoryFallback";
+import {settledWithin} from "./StdUtils";
+import type {ToolCallReports} from "./ToolCallReports";
+import {ToolCallReportingConnection} from "./ToolCallReportingConnection";
 import {
     AUTH_STATUS_META_KEY,
     AUTH_STATUS_UPDATE_METHOD,
     authStatusCapability,
     type AuthStatus,
+    type AuthenticationStatusResponse,
     GOAL_CONTROL_ACTIONS,
     GOAL_CONTROL_METHOD,
     GOAL_EXTENSION_VERSION,
@@ -90,19 +107,19 @@ import {
     type KandevGuardedTtyExecReceipt,
     type KandevGuardedTtyExecRequest,
 } from "./AcpExtensions";
-import {
-    createCollabAgentToolCallUpdate,
-    createCommandExecutionCompleteUpdate,
-    createCommandExecutionUpdate,
-    createCompletedContextCompactionUpdate,
-    createDynamicToolCallUpdate,
-    createFileChangeUpdate,
-    createImageGenerationUpdate,
-    createImageViewUpdate,
-    createMcpToolCallUpdate,
-    createSubAgentActivityUpdate,
-    formatWebSearchTitle,
-} from "./CodexToolCallMapper";
+import {AcpToolCallRenderer} from "./tool-calls/AcpToolCallRenderer";
+import {ClientCapabilities} from "./tool-calls/ClientCapabilities";
+import {CollabAgentReporter} from "./tool-calls/reporters/CollabAgentReporter";
+import {CommandReporter} from "./tool-calls/reporters/CommandReporter";
+import {CompactionReporter} from "./tool-calls/reporters/CompactionReporter";
+import {DynamicToolReporter} from "./tool-calls/reporters/DynamicToolReporter";
+import {FileChangeReporter} from "./tool-calls/reporters/FileChangeReporter";
+import {ImageGenerationReporter} from "./tool-calls/reporters/ImageGenerationReporter";
+import {ImageViewReporter} from "./tool-calls/reporters/ImageViewReporter";
+import {McpToolReporter} from "./tool-calls/reporters/McpToolReporter";
+import {PlanReviewReporter} from "./tool-calls/reporters/PlanReviewReporter";
+import {SubagentActivityReporter} from "./tool-calls/reporters/SubagentActivityReporter";
+import {WebSearchReporter} from "./tool-calls/reporters/WebSearchReporter";
 import {
     clientSupportsBooleanConfigOptions,
     createFastModeConfigOption,
@@ -114,27 +131,29 @@ import {
 } from "./FastModeConfig";
 import packageJson from "../package.json";
 import {isJetBrains2026_1Client} from "./JBUtils";
-import {
-    clientSupportsTerminalOutputDelta,
-    resolveTerminalOutputMode,
-    type TerminalOutputMode,
-} from "./TerminalOutputMode";
-import {clientSupportsPlanUpdates} from "./PlanCapabilities";
 import {clientSupportsNotices} from "./SessionNotice";
 import {
     createAgentTextMessageChunk,
     createAgentTextThoughtChunk,
-    createCodexMessagePhaseMeta,
+    createMessagePhaseMeta,
     createUserMessageChunk,
 } from "./ContentChunks";
-import {sameThreadGoalSnapshot, type ThreadGoalSnapshot, toThreadGoalSnapshot,} from "./ThreadGoalSnapshot";
+import {
+    goalSessionInfoUpdate,
+    sameThreadGoalSnapshot,
+    type ThreadGoalSnapshot,
+    toThreadGoalSnapshot,
+} from "./ThreadGoalSnapshot";
 import {
     clientSupportsSubagents,
     type SubagentAwareSessionCapabilities,
 } from "./subagents/AcpSubagents";
 import {CodexSubagentEventRouter} from "./subagents/CodexSubagentEventRouter";
 import {nameFromAgentPath} from "./subagents/CodexAgentPath";
+import {listCodexHooks, trustCodexHooks, type CodexHookIdentity} from "./CodexHookTrust";
+import type {HooksListEntry} from "./app-server/v2/HooksListEntry";
 import {
+    accountFromUpdated,
     fromAccount,
     fromAccountUpdated,
     gatewayStatus,
@@ -145,17 +164,25 @@ import {TitleGenerator} from "./TitleGenerator";
 import {once} from "node:events";
 import {
     AIR_AGENT_FILE_CHANGE_REPORT_KEY,
+    AIR_CUSTOM_INSTRUCTIONS_KEY,
     AIR_ASYNC_TASKS_KEY,
+    AIR_CODEX_HOOKS_KEY,
+    AIR_DIFF_PATCH_KEY,
     AIR_NATIVE_SUBAGENT_SESSIONS_KEY,
+    AIR_PLAN_CONTENT_DELTA_KEY,
+    AIR_RAW_INPUT_RENDERING_KEY,
     AIR_RECOMMENDED_CONFIG_VALUE_KEY,
     AIR_EXTENSION_CAPABILITIES_KEY,
     AIR_EXTENSION_VERSION,
+    AIR_GOAL_KEY,
     AIR_EXTENSION_VERSION_KEY,
     AIR_META_KEY,
     AIR_SESSION_FAILURE_KEY,
     clientSupportsAirCapability,
     JETBRAINS_META_KEY,
 } from "./AirExtension";
+import {SessionIndexService} from "./SessionIndexService";
+import type {SessionIndexTitleState} from "./SessionIndexTitles";
 import {ASYNC_TASK_STOP_METHOD} from "./async-tasks/AsyncTaskExtension";
 import {CodexBackgroundTerminalTasks} from "./async-tasks/CodexBackgroundTerminalTasks";
 import {clientSupportsCompaction, CodexSessionCompactions, createCompactionUpdate} from "./CodexSessionCompactions";
@@ -176,7 +203,7 @@ import {
 } from "./GuardedTtyExec";
 
 
-export interface SessionState {
+export interface SessionState extends SessionIndexTitleState {
     sessionId: string,
     currentModelId: string,
     availableModels: Array<Model>,
@@ -187,6 +214,10 @@ export interface SessionState {
     currentTurnId: string | null;
     lastTokenUsage: TokenCount | null;
     totalTokenUsage: TokenCount | null;
+    /** The token usage of the current or last prompt, which its PromptResponse reports. */
+    promptTokenUsage: PromptTokenUsage | null;
+    /** Whether the thread may have token usage from before this session, as a loaded, resumed or forked thread. */
+    threadHasHistory: boolean;
     modelContextWindow: number | null;
     rateLimits: RateLimitsMap | null;
     account: Account | null;
@@ -198,8 +229,8 @@ export interface SessionState {
     fastModeEnabled: boolean;
     currentModelSupportsFast: boolean;
     sessionMcpServers?: Array<string>;
-    terminalOutputMode: TerminalOutputMode;
-    terminalOutputDeltaSupported: boolean;
+    /** The capability choices of the client for tool call and plan reports. */
+    clientCapabilities: ClientCapabilities;
     currentGoal?: ThreadGoalSnapshot | null;
     goalRevision: number;
     sessionTitle: string | null;
@@ -209,6 +240,7 @@ export interface SessionState {
     subagents: CodexSubagentEventRouter;
     asyncTasks: CodexBackgroundTerminalTasks;
     compactions: CodexSessionCompactions;
+    toolCallReports: ToolCallReports;
 }
 
 export type SessionFailureCategory =
@@ -232,8 +264,6 @@ export interface SessionFailure {
     actions: SessionFailureAction[];
 }
 
-const CODEX_PROCESS_EXITED_ERROR_CODE = 1001;
-
 /**
  * How long `session/load` waits for an in-flight title generation to settle
  * before answering anyway. Generous enough for a title model round-trip, short
@@ -249,6 +279,15 @@ const TITLE_GENERATION_SETTLE_TIMEOUT_MS = 10_000;
  */
 const NO_ACTIVE_TURN_RETRY_DELAYS_MS = [25, 50, 100, 200, 400];
 
+/**
+ * How long after its start `session/load` waits for the account read when `thread/resume` is done or failed.
+ * A missing login needs no network call, so the read answers fast and the load fails with `auth_required`.
+ * A ChatGPT login waits for the ChatGPT backend, which the app-server waits for up to 15 s.
+ * Such a read can still find a login that does not work, for example a revoked token (401).
+ * The load then answers without the read, and `applyLateAccountRead` reports the answer later.
+ */
+const ACCOUNT_READ_LOAD_GRACE_MS = 1_000;
+
 function clientSupportsTypedSessionFailures(capabilities: acp.ClientCapabilities | null): boolean {
     return clientSupportsAirCapability(capabilities, AIR_SESSION_FAILURE_KEY);
 }
@@ -262,9 +301,15 @@ interface ActiveAuthState {
     authConfigured: boolean;
 }
 
-interface PendingMcpStartupSession {
-    requestedServers: Set<string>;
-    startup: Promise<McpStartupResult>;
+/**
+ * An account read that a session open already has. `null` means no read.
+ * `"unavailable"` means a read that failed without an answer about the login, see {@link isAccountReadUnavailableError}.
+ */
+type KnownAccount = GetAccountResponse | "unavailable" | null;
+
+/** True for the `auth_required` error that {@link CodexAcpServer.checkAuthorization} throws. */
+function isAuthRequiredError(error: unknown): boolean {
+    return error instanceof RequestError && error.code === RequestError.authRequired().code;
 }
 
 interface PendingTurnStart {
@@ -281,20 +326,29 @@ interface ActivePrompt {
     requestCancel: () => void;
     requestClose: () => void;
     complete: () => void;
+    /** The client sent `session/cancel` for this prompt. A prompt that ends after it answers `cancelled`. */
+    clientCancelled: boolean;
+    clientCancelSignal: Promise<null>;
+    requestClientCancel: () => void;
 }
 
 export interface CodexProcessState {
     connection: CodexConnection;
     codexPath: string | undefined;
     config: JsonObject | undefined;
+    appServerStartupArgs: string[];
     modelProvider: string | undefined;
     stderr: string;
     stderrProcess?: CodexConnection["process"];
+    /** Owns the app-server child; created by `index.ts`, or by the server for a state without one. */
+    supervisor?: CodexAppServerSupervisor;
 }
 
 export class CodexAcpServer {
     private codexAcpClient: CodexAcpClient;
     private readonly connection: AcpClientConnection;
+    private readonly mcpServerSignIn: McpServerSignIn;
+    private readonly reportingConnection: ToolCallReportingConnection;
     private readonly defaultAuthRequest: CodexAuthRequest | null;
     private readonly getExitCode: () => number | null;
     private readonly getRecentStderr: () => string;
@@ -302,14 +356,24 @@ export class CodexAcpServer {
     private availableCommands: CodexCommands;
     private clientInfo: acp.Implementation | null;
     private clientCapabilities: acp.ClientCapabilities | null;
-    private terminalOutputMode: TerminalOutputMode;
-    private terminalOutputDeltaSupported: boolean;
+    /** The capability choices of the client for tool call and plan reports. */
+    private capabilities: ClientCapabilities;
     private booleanConfigOptionsSupported: boolean;
     /** Last `authStatus` pushed to the client; used to suppress duplicates. */
     private currentAuthStatus: AuthStatus | null;
+    /**
+     * The last known account of the agent. Every successful account read and every `account/updated` sets it,
+     * and a logout clears it. A session open takes it when the account read is unavailable.
+     */
+    private lastReadAccount: Account | null = null;
+    /**
+     * Counts the calls of {@link setAuthStatus}, also the calls that push nothing. A late account read
+     * compares it with the value at the start of the read: a change means a newer status.
+     */
+    private authStatusVersion = 0;
 
     private readonly sessions: Map<string, SessionState>;
-    private readonly pendingMcpStartupSessions: Map<string, PendingMcpStartupSession>;
+    private readonly mcpSessionStartup: McpSessionStartup;
     private readonly pendingTurnStarts: Map<string, PendingTurnStart>;
     private readonly activePrompts: Map<string, ActivePrompt>;
     private readonly steeringQueues: Map<string, SteeringQueue>;
@@ -321,9 +385,26 @@ export class CodexAcpServer {
     private acpDisconnected = false;
     private readonly permissionLifecycleContexts: WeakMap<SessionState, PermissionLifecycleContext>;
     private readonly codexProcessState: CodexProcessState | null;
-    private codexProcessGeneration = 0;
+    /** Brings the app-server back after a crash; `null` without a process state (tests). */
+    private readonly recovery: AppServerRecovery<SessionState> | null;
     private initializeRequest: acp.InitializeRequest | null = null;
     private providerUpdate: Promise<void> | null = null;
+    /** The AIR `sessionIndex` extension, see `SessionIndexService.ts`. */
+    readonly sessionIndex = new SessionIndexService({
+        connection: () => this.connection,
+        client: () => this.codexAcpClient,
+        ensureAppServer: async () => {
+            await this.ensureAppServer();
+        },
+        runWithProcessCheck: (operation) => this.runWithProcessCheck(operation),
+        session: (sessionId) => this.sessions.get(sessionId),
+        hasLocalSession: (sessionId) => this.hasLocalSession(sessionId),
+        closeSession: async (sessionId) => {
+            await this.closeSession({sessionId});
+        },
+        beginSessionCloseFence: (sessionId) => this.beginSessionCloseFence(sessionId),
+        endSessionCloseFence: (sessionId) => this.endSessionCloseFence(sessionId),
+    });
 
     constructor(
         connection: AcpClientConnection,
@@ -335,7 +416,6 @@ export class CodexAcpServer {
         acpConnectionSignal?: AbortSignal,
     ) {
         this.sessions = new Map();
-        this.pendingMcpStartupSessions = new Map();
         this.pendingTurnStarts = new Map();
         this.activePrompts = new Map();
         this.steeringQueues = new Map();
@@ -345,8 +425,22 @@ export class CodexAcpServer {
         this.goalControlGenerations = new Map();
         this.guardedTtyExecutions = new Map();
         this.permissionLifecycleContexts = new WeakMap();
-        this.connection = connection;
+        this.reportingConnection = new ToolCallReportingConnection(connection);
+        this.connection = this.reportingConnection.asClientConnection();
         this.codexAcpClient = codexAcpClient;
+        this.mcpServerSignIn = createMcpServerSignIn(
+            this.connection,
+            () => this.codexAcpClient,
+            () => this.clientCapabilities,
+        );
+        this.mcpSessionStartup = new McpSessionStartup(
+            this.connection,
+            () => this.codexAcpClient,
+            (operation) => this.runWithProcessCheck(operation),
+            this.mcpServerSignIn,
+            () => this.capabilities,
+            (sessionId) => this.sessions.has(sessionId) && !this.sessionIsClosing(sessionId),
+        );
         this.defaultAuthRequest = defaultAuthRequest ?? null;
         this.codexProcessState = codexProcessState ?? null;
         this.captureStderr();
@@ -355,17 +449,16 @@ export class CodexAcpServer {
         this.sessionFailureEpoch = randomUUID();
         this.clientInfo = null;
         this.clientCapabilities = null;
-        this.terminalOutputMode = "terminal_output_delta";
-        this.terminalOutputDeltaSupported = false;
+        this.capabilities = ClientCapabilities.DEFAULT;
         this.booleanConfigOptionsSupported = false;
         this.currentAuthStatus = null;
         this.availableCommands = this.createAvailableCommands(codexAcpClient);
-        this.observeCodexProcess();
         if (acpConnectionSignal?.aborted) {
             this.onAcpDisconnect();
         } else {
             acpConnectionSignal?.addEventListener("abort", () => this.onAcpDisconnect(), {once: true});
         }
+        this.recovery = this.createRecovery();
     }
 
     private createAvailableCommands(client: CodexAcpClient): CodexCommands {
@@ -373,7 +466,8 @@ export class CodexAcpServer {
             this.connection,
             client,
             (operation) => this.runWithProcessCheck(operation),
-            () => this.refreshAuthState(null)
+            () => this.refreshAuthState(null),
+            this.mcpServerSignIn,
         );
     }
 
@@ -384,11 +478,20 @@ export class CodexAcpServer {
         this.clientInfo = _params.clientInfo ?? null;
         this.clientCapabilities = _params.clientCapabilities ?? null;
         this.initializeRequest = _params;
-        this.terminalOutputMode = resolveTerminalOutputMode(_params.clientCapabilities);
-        this.terminalOutputDeltaSupported = clientSupportsTerminalOutputDelta(_params.clientCapabilities);
+        this.capabilities = ClientCapabilities.from(_params.clientCapabilities);
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
+        this.reportingConnection.reports.compareMeta = this.capabilities.airClient;
         this.booleanConfigOptionsSupported = clientSupportsBooleanConfigOptions(_params.clientCapabilities);
+        this.sessionIndex.configure(_params.clientCapabilities);
         await this.runWithProcessCheck(() => this.codexAcpClient.initialize(_params));
+        this.sessionIndex.observe(this.codexAcpClient);
         this.publishFirstAuthStatusAfterResponse();
+        const goalCapability = {
+            version: GOAL_EXTENSION_VERSION,
+            controlMethod: GOAL_CONTROL_METHOD,
+            actions: [...GOAL_CONTROL_ACTIONS],
+        };
         const sessionCapabilities: SubagentAwareSessionCapabilities = {
             resume: { },
             list: { },
@@ -432,31 +535,50 @@ export class CodexAcpServer {
                 steering: {
                     supported: true,
                 },
-                goal: {
-                    version: GOAL_EXTENSION_VERSION,
-                    controlMethod: GOAL_CONTROL_METHOD,
-                    actions: [...GOAL_CONTROL_ACTIONS],
-                },
                 guardedTtyExec: {
                     capability: KANDEV_GUARDED_TTY_CAPABILITY,
                     version: KANDEV_GUARDED_TTY_VERSION,
                     capabilityMethod: KANDEV_GUARDED_TTY_CAPABILITY_METHOD,
                     execMethod: KANDEV_GUARDED_TTY_EXEC_METHOD,
                 },
-                [JETBRAINS_META_KEY]: {
-                    [AIR_META_KEY]: {
-                        [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
-                        [AIR_EXTENSION_CAPABILITIES_KEY]: [
-                            AIR_SESSION_FAILURE_KEY,
-                            AIR_AGENT_FILE_CHANGE_REPORT_KEY,
-                            AIR_NATIVE_SUBAGENT_SESSIONS_KEY,
-                            AIR_ASYNC_TASKS_KEY,
-                            AIR_RECOMMENDED_CONFIG_VALUE_KEY,
-                        ],
+                // Only AIR gets the AIR extension, see `docs/air-extensions.md`.
+                ...(this.capabilities.airClient ? {
+                    [JETBRAINS_META_KEY]: {
+                        [AIR_META_KEY]: {
+                            [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
+                            [AIR_GOAL_KEY]: goalCapability,
+                            [AIR_EXTENSION_CAPABILITIES_KEY]: [
+                                AIR_SESSION_FAILURE_KEY,
+                                AIR_DIFF_PATCH_KEY,
+                                AIR_AGENT_FILE_CHANGE_REPORT_KEY,
+                                AIR_CUSTOM_INSTRUCTIONS_KEY,
+                                AIR_NATIVE_SUBAGENT_SESSIONS_KEY,
+                                AIR_ASYNC_TASKS_KEY,
+                                AIR_RECOMMENDED_CONFIG_VALUE_KEY,
+                                AIR_RAW_INPUT_RENDERING_KEY,
+                                AIR_PLAN_CONTENT_DELTA_KEY,
+                                AIR_CODEX_HOOKS_KEY,
+                                ...this.sessionIndex.agentCapabilities(),
+                            ],
+                        },
                     },
-                },
+                } : {}),
             },
         };
+    }
+
+    async listHooks(cwd: string): Promise<HooksListEntry> {
+        if (this.providerUpdate !== null) await this.waitForProviderUpdate();
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
+        return await this.runWithProcessCheck(() => listCodexHooks(this.codexAcpClient.appServerClient, cwd));
+    }
+
+    async trustHooks(cwd: string, hooks: CodexHookIdentity[]): Promise<{trusted: boolean}> {
+        if (this.providerUpdate !== null) await this.waitForProviderUpdate();
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
+        return {trusted: await this.runWithProcessCheck(() => trustCodexHooks(this.codexAcpClient.appServerClient, cwd, hooks))};
     }
 
     async extMethod(
@@ -470,7 +592,7 @@ export class CodexAcpServer {
         }
         switch (methodRequest.method) {
             case "authentication/status":
-                return await this.runWithProcessCheck(() => this.codexAcpClient.getAuthenticationStatus());
+                return await this.readAuthenticationStatus();
             case "authentication/logout": {
                 await this.logout({});
                 return {};
@@ -488,10 +610,12 @@ export class CodexAcpServer {
                 );
             case ASYNC_TASK_STOP_METHOD: {
                 if (this.providerUpdate !== null) {
-                    await this.providerUpdate;
+                    await this.waitForProviderUpdate();
                 }
                 const sessionState = this.sessions.get(methodRequest.params.sessionId);
                 if (!sessionState) return {stopped: false};
+                // A task of a dead app-server is failed already; stopping it needs no restarted one.
+                if (this.recovery !== null && !this.recovery.sessionIsLive(sessionState)) return {stopped: false};
                 return {
                     stopped: await this.runWithProcessCheck(
                         () => sessionState.asyncTasks.stop(methodRequest.params.asyncTaskId),
@@ -504,6 +628,11 @@ export class CodexAcpServer {
                 if (!sessionState) {
                     throw RequestError.invalidParams(undefined, `Unknown session: ${methodRequest.params.sessionId}`);
                 }
+                if (this.providerUpdate !== null) {
+                    await this.waitForProviderUpdate();
+                }
+                const sessionReady = this.ensureSessionReady(sessionState);
+                if (sessionReady) await sessionReady;
                 const sessionGeneration = this.getSessionGeneration(sessionState.sessionId);
                 const goalControlGeneration = this.bumpGoalControlGeneration(sessionState.sessionId);
                 if (methodRequest.params.action === "set") {
@@ -561,10 +690,45 @@ export class CodexAcpServer {
         }
     }
 
-    async checkAuthorization(){
-        const authNeeded = await this.runWithProcessCheck(() => this.codexAcpClient.authRequired());
-        logger.log("Auth requirement checked", {authRequired: authNeeded});
-        if (authNeeded) {
+    /**
+     * Answers `authentication/status`.
+     *
+     * An unavailable account read still tells that the agent has a ChatGPT login, because only such a login
+     * runs the routing discovery, see {@link isAccountReadUnavailableError}. The answer is then `chat-gpt` with
+     * the email of the last known account, or an empty email. A read that failed because the login does not
+     * work answers `unauthenticated`, see {@link isAccountReadAuthFailureError}. Another error rejects.
+     */
+    private async readAuthenticationStatus(): Promise<AuthenticationStatusResponse> {
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
+        try {
+            return await this.runWithProcessCheck(() => this.codexAcpClient.getAuthenticationStatus());
+        } catch (error) {
+            if (isAccountReadUnavailableError(error)) {
+                logger.log("Account read unavailable, so the authentication status uses the last known account", {error: String(error)});
+                const account = this.lastReadAccount;
+                return {type: "chat-gpt", email: account?.type === "chatgpt" ? account.email ?? "" : ""};
+            }
+            if (isAccountReadAuthFailureError(error)) {
+                logger.log("The account read found that the agent needs a login", {error: String(error)});
+                return {type: "unauthenticated"};
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * Logs in with the default auth request, or throws `auth_required`, when the agent needs a login.
+     * Returns the account read that found no login needed, or `null` when there was no read or a login ran.
+     * Returns `"unavailable"` when the read failed without an answer about the login, see
+     * {@link isAccountReadUnavailableError}. The session open then continues: a missing login fails the
+     * resume or the first turn with the real error.
+     */
+    async checkAuthorization(): Promise<KnownAccount> {
+        const requirement = await this.readAccountOrUnavailable(() => this.codexAcpClient.readAuthRequirement());
+        if (requirement === "unavailable") return "unavailable";
+        logger.log("Auth requirement checked", {authRequired: requirement.required});
+        if (requirement.required) {
             if (this.defaultAuthRequest) {
                 logger.log("Authenticating with default auth request...", {
                     authRequest: this.defaultAuthRequest
@@ -575,7 +739,9 @@ export class CodexAcpServer {
                 logger.log("Authentication required but no default auth request provided, return to IDE");
                 throw RequestError.authRequired();
             }
+            return null;
         }
+        return requirement.account;
     }
 
     async getOrCreateSession(request: acp.NewSessionRequest | acp.ResumeSessionRequest): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
@@ -609,6 +775,34 @@ export class CodexAcpServer {
         return generation;
     }
 
+    /**
+     * Whether a fork that failed before its session was installed may unsubscribe its thread. A client can find
+     * the new thread in the session list and load it meanwhile; that open owns the subscription then.
+     */
+    private canReleaseFailedFork(threadId: string): boolean {
+        return !this.sessionOpenGenerations.has(threadId) && !this.sessions.has(threadId);
+    }
+
+    /**
+     * Unsubscribes the thread of a fork that failed before its session was installed, see
+     * {@link canReleaseFailedFork}. The close fence keeps a new open of the thread out until the unsubscribe and
+     * the handler cleanup are done, as for {@link cleanupStaleSessionOpen}.
+     */
+    private async releaseFailedFork(threadId: string): Promise<void> {
+        if (!this.canReleaseFailedFork(threadId)) return;
+        this.beginSessionCloseFence(threadId);
+        try {
+            // A dead app-server holds nothing to close.
+            if (this.recovery === null || this.recovery.isReady()) {
+                await this.codexAcpClient.closeSession(threadId);
+            }
+        } catch (err) {
+            logger.error(`Failed to close the thread of a failed fork ${threadId}`, err);
+        } finally {
+            this.endSessionCloseFence(threadId);
+        }
+    }
+
     private sessionOpenCanInstall(sessionId: string, generation: number): boolean {
         return !this.sessionIsClosing(sessionId) && this.getSessionGeneration(sessionId) === generation;
     }
@@ -620,7 +814,10 @@ export class CodexAcpServer {
             }
             this.beginSessionCloseFence(sessionId);
             try {
-                await this.runWithProcessCheck(() => this.codexAcpClient.closeSession(sessionId));
+                // A dead app-server holds nothing to close.
+                if (this.recovery === null || this.recovery.isReady()) {
+                    await this.runWithProcessCheck(() => this.codexAcpClient.closeSession(sessionId));
+                }
             } catch (err) {
                 logger.error(`Failed to close stale session open for ${sessionId}`, err);
             } finally {
@@ -677,23 +874,31 @@ export class CodexAcpServer {
         const requestedSessionGeneration = operation === "resume"
             ? this.beginSessionOpen(existingSessionRequest.sessionId)
             : null;
-        await this.checkAuthorization();
+        const knownAccount = await this.checkAuthorization();
         const requestedMcpServers = request.mcpServers ?? [];
-        const mcpServerStartupVersion = requestedMcpServers.length > 0
+        const readMcpServerStartupVersion = () => requestedMcpServers.length > 0
             ? this.codexAcpClient.getMcpServerStartupVersion()
             : null;
+        let mcpServerStartupVersion = readMcpServerStartupVersion();
 
         let sessionMetadata: SessionMetadata;
         let resumeSubscribed = false;
+        // The app-server that loads the thread, read in the closure that loads it. A crash after the load makes the
+        // session stale, see AppServerRecovery.
+        let openGeneration = this.recovery?.generation ?? 0;
         if (operation === "resume") {
             const resumeRequest = request as acp.ResumeSessionRequest;
             logger.log(`Resume existing session: ${resumeRequest.sessionId}...`);
             try {
-                sessionMetadata = await this.runWithProcessCheck(() =>
-                    this.codexAcpClient.resumeSession(resumeRequest, () => {
+                const pendingResume = this.recovery?.settleResume(resumeRequest.sessionId);
+                if (pendingResume) await pendingResume;
+                sessionMetadata = await this.runWithProcessCheck(() => {
+                    openGeneration = this.recovery?.generation ?? 0;
+                    mcpServerStartupVersion = readMcpServerStartupVersion();
+                    return this.codexAcpClient.resumeSession(resumeRequest, () => {
                         resumeSubscribed = true;
-                    })
-                );
+                    });
+                });
             } catch (err) {
                 if (resumeSubscribed && requestedSessionGeneration !== null) {
                     await this.cleanupStaleSessionOpen(resumeRequest.sessionId, requestedSessionGeneration);
@@ -703,20 +908,31 @@ export class CodexAcpServer {
         } else if (operation === "fork") {
             const forkRequest = request as acp.ForkSessionRequest;
             logger.log(`Fork existing session: ${forkRequest.sessionId}...`);
-            sessionMetadata = await this.runWithProcessCheck(() => this.codexAcpClient.forkSession(forkRequest));
+            sessionMetadata = await this.runWithProcessCheck(() => {
+                openGeneration = this.recovery?.generation ?? 0;
+                mcpServerStartupVersion = readMcpServerStartupVersion();
+                return this.codexAcpClient.forkSession(forkRequest, threadId => this.releaseFailedFork(threadId));
+            });
         } else {
             logger.log(`Create new session...`);
-            sessionMetadata = await this.runWithProcessCheck(() => this.codexAcpClient.newSession(request as acp.NewSessionRequest));
+            sessionMetadata = await this.runWithProcessCheck(() => {
+                openGeneration = this.recovery?.generation ?? 0;
+                mcpServerStartupVersion = readMcpServerStartupVersion();
+                return this.codexAcpClient.newSession(request as acp.NewSessionRequest);
+            });
         }
 
         const {sessionId, currentModelId, models} = sessionMetadata;
         const authProvider = sessionMetadata.modelProvider ?? this.codexAcpClient.getModelProvider();
         let authState: ActiveAuthState;
         try {
-            authState = await this.getAuthStateForProvider(authProvider);
+            authState = await this.getAuthStateForProvider(authProvider, knownAccount);
         } catch (err) {
             if (resumeSubscribed && requestedSessionGeneration !== null) {
                 await this.cleanupStaleSessionOpen(sessionId, requestedSessionGeneration);
+            } else if (operation === "fork") {
+                // The fork stays subscribed after `thread/fork`; without a session nothing would unsubscribe it.
+                await this.releaseFailedFork(sessionId);
             }
             throw err;
         }
@@ -739,6 +955,8 @@ export class CodexAcpServer {
             currentTurnId: null,
             lastTokenUsage: null,
             totalTokenUsage: null,
+            promptTokenUsage: null,
+            threadHasHistory: operation !== "new",
             modelContextWindow: null,
             rateLimits: null,
             account: authState.account,
@@ -750,8 +968,7 @@ export class CodexAcpServer {
             fastModeEnabled: sessionMetadata.currentServiceTier === "fast",
             currentModelSupportsFast: currentModelSupportsFast,
             sessionMcpServers: sessionMcpServers,
-            terminalOutputMode: this.terminalOutputMode,
-            terminalOutputDeltaSupported: this.terminalOutputDeltaSupported,
+            clientCapabilities: this.capabilities,
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: operation === "resume" ? "unknown" : "unset",
@@ -759,41 +976,41 @@ export class CodexAcpServer {
                 sessionId,
                 clientSupportsSubagents(this.clientCapabilities),
                 new ACPSessionConnection(this.connection, sessionId),
+                childSessionId => this.reportingConnection.reports.releaseOpen(childSessionId),
             ),
             asyncTasks: this.createAsyncTasks(sessionId),
             compactions: new CodexSessionCompactions(),
+            toolCallReports: this.reportingConnection.reports,
         };
         sessionState.titleGen = new TitleGenerator(
             this.codexAcpClient.appServerClient,
             sessionId,
             sessionState.cwd,
             () => sessionState.sessionTitleSource,
+            this.sessionIndex.titleWriter(sessionId),
         );
         this.installSessionState(sessionState);
+        this.recovery?.markLoaded(sessionState, openGeneration);
         resumeSubscribed = false;
 
         const canPublishSessionUpdates = operation !== "fork";
         if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
-            const pendingStartup = this.createPendingMcpStartupSession(
-                requestedMcpServers,
-                mcpServerStartupVersion,
-            );
-            if (canPublishSessionUpdates) {
-                this.pendingMcpStartupSessions.set(sessionId, pendingStartup);
-            }
-            const startupAwaitTimeoutMs = parseMcpStartupAwaitTimeoutMs(request._meta);
-            if (startupAwaitTimeoutMs !== undefined && startupAwaitTimeoutMs > 0) {
+            // A fork publishes no startup report, so nothing waits for the rest of the startup.
+            const startupWait = this.mcpSessionStartup.begin(sessionId, requestedMcpServers, mcpServerStartupVersion, {
+                publish: canPublishSessionUpdates,
+                awaitTimeoutMs: parseMcpStartupAwaitTimeoutMs(request._meta),
+                skippedServers: sessionMetadata.skippedMcpServers,
+            });
+            if (startupWait !== null) {
                 try {
-                    await raceMcpStartupTimeout(pendingStartup.startup, startupAwaitTimeoutMs);
+                    await startupWait;
                 } catch (err) {
-                    if (this.pendingMcpStartupSessions.get(sessionId) === pendingStartup) {
-                        this.pendingMcpStartupSessions.delete(sessionId);
-                    }
+                    // The session is installed already. A failed wait closes it, so the client never gets a half-open session.
+                    await this.closeSession({sessionId}).catch(closeError => {
+                        logger.error(`Failed to close session ${sessionId} after a failed MCP startup wait`, closeError);
+                    });
                     throw err;
                 }
-            }
-            if (canPublishSessionUpdates) {
-                this.publishMcpStartupStatusAsync(sessionId);
             }
         }
 
@@ -805,12 +1022,24 @@ export class CodexAcpServer {
             this.publishAsyncTasksAsync(sessionState, sessionGeneration);
         }
         const sessionModelState: LegacySessionModelState = this.createModelState(models, currentModelId);
-        const sessionModeState: SessionModeState = sessionState.agentMode.toSessionModeState();
+        const sessionModeState: SessionModeState =
+            sessionState.agentMode.toSessionModeState(sessionState.clientCapabilities.airClient);
 
         return [sessionId, sessionModelState, sessionModeState];
     }
 
-    private async getAuthStateForProvider(authProvider: string | null): Promise<ActiveAuthState> {
+    /**
+     * Reads the account of `authProvider` and pushes the auth status. `knownAccount` is an account read that
+     * the caller already has.
+     *
+     * When the read is unavailable, the adapter pushes no status, so the client keeps the last status.
+     * A `none` status would be false here: AIR shows a login request for it. The session keeps the
+     * account of the last read.
+     */
+    private async getAuthStateForProvider(
+        authProvider: string | null,
+        knownAccount: KnownAccount = null,
+    ): Promise<ActiveAuthState> {
         if (!this.authProviderUsesOpenAiAccount(authProvider)) {
             await this.publishAuthStatus(authProvider, null);
             return {
@@ -818,12 +1047,104 @@ export class CodexAcpServer {
                 authConfigured: true,
             };
         }
-        const accountResponse = await this.runWithProcessCheck(() => this.codexAcpClient.getAccount());
+        const accountResponse = knownAccount === "unavailable"
+            ? null
+            : knownAccount ?? await this.readAccountIfAvailable();
+        if (accountResponse === null) {
+            logger.log("No account read, so the auth status stays as it was");
+            return {
+                account: this.lastReadAccount,
+                authConfigured: true,
+            };
+        }
+        this.lastReadAccount = accountResponse.account;
         await this.publishAuthStatus(authProvider, accountResponse.account);
         return {
             account: accountResponse.account,
             authConfigured: accountResponse.account !== null || !accountResponse.requiresOpenaiAuth,
         };
+    }
+
+    /** Reads the account, or returns `null` when the read failed without an answer about the login. */
+    private async readAccountIfAvailable(): Promise<GetAccountResponse | null> {
+        const response = await this.readAccountOrUnavailable(() => this.codexAcpClient.getAccount());
+        return response === "unavailable" ? null : response;
+    }
+
+    /**
+     * Runs an account read, or returns `"unavailable"` when it failed without an answer about the login,
+     * see {@link isAccountReadUnavailableError}. Another error rejects.
+     */
+    private async readAccountOrUnavailable<T>(read: () => Promise<T>): Promise<T | "unavailable"> {
+        try {
+            return await this.runWithProcessCheck(read);
+        } catch (error) {
+            if (!isAccountReadUnavailableError(error)) throw error;
+            logger.log("Account read unavailable, the login state is unknown", {error: String(error)});
+            return "unavailable";
+        }
+    }
+
+    /**
+     * Applies the account read of a load that answered before the read ended.
+     *
+     * The answer applies only while the load is the current open of the session, and while no auth status
+     * was set after the read started. A close or a new load of the session makes the answer old.
+     * A newer status, from any source, also makes it old. An old answer changes nothing.
+     *
+     * - A read that found no login needed sets the account of the session and pushes the auth status.
+     * - A read that found that the agent needs a login (`auth_required`), or that failed because the login
+     *   does not work ({@link isAccountReadAuthFailureError}, for example a revoked token), clears the account
+     *   and pushes the `none` status at once, with no second read. The client then shows a login request,
+     *   as it does for an `auth_required` error of the load.
+     * - A read that failed because another client logged in or out reads the account again and pushes it.
+     * - An unavailable read changes nothing.
+     * - Any other failure is logged as an error and pushes nothing. It tells nothing sure about the login,
+     *   so the client keeps the last status.
+     */
+    private applyLateAccountRead(
+        sessionState: SessionState,
+        authorization: Promise<KnownAccount>,
+        authStatusVersionAtStart: number,
+    ): void {
+        const sessionIsCurrent = () => this.sessions.get(sessionState.sessionId) === sessionState;
+        const answerIsCurrent = () => {
+            if (!sessionIsCurrent()) {
+                logger.log("A late account read ended after the load closed, so it changes nothing", {sessionId: sessionState.sessionId});
+                return false;
+            }
+            if (this.authStatusVersion !== authStatusVersionAtStart) {
+                logger.log("A late account read ended after a newer auth status, so it changes nothing", {sessionId: sessionState.sessionId});
+                return false;
+            }
+            return true;
+        };
+        void authorization.then(
+            async knownAccount => {
+                if (knownAccount === "unavailable" || !answerIsCurrent()) return;
+                const authState = await this.getAuthStateForProvider(sessionState.authProvider, knownAccount);
+                if (!sessionIsCurrent()) return;
+                sessionState.account = authState.account;
+                sessionState.authConfigured = authState.authConfigured;
+            },
+            async error => {
+                if (!answerIsCurrent()) return;
+                if (isAuthRequiredError(error) || isAccountReadAuthFailureError(error)) {
+                    logger.log("A late account read found that the agent needs a login", {error: String(error)});
+                    this.lastReadAccount = null;
+                    sessionState.account = null;
+                    sessionState.authConfigured = false;
+                    await this.publishAuthStatus(sessionState.authProvider, null);
+                    return;
+                }
+                if (isAccountReadAccountChangedError(error)) {
+                    logger.log("The account changed while a late account read ran, so the adapter reads it again");
+                    await this.publishAuthStatusRead();
+                    return;
+                }
+                logger.error("A late account read failed, so the auth status stays as it was", error);
+            },
+        ).catch(error => logger.error("Failed to apply a late account read", error));
     }
 
     private authProviderUsesOpenAiAccount(authProvider: string | null): boolean {
@@ -859,9 +1180,17 @@ export class CodexAcpServer {
     }
 
     async loadSession(params: acp.LoadSessionRequest): Promise<LegacyLoadSessionResponse> {
+        return this.recovery === null
+            ? await this.loadSessionOnce(params)
+            : await this.recovery.trackOpen(params.sessionId, () => this.loadSessionOnce(params));
+    }
+
+    private async loadSessionOnce(params: acp.LoadSessionRequest): Promise<LegacyLoadSessionResponse> {
         if (this.providerUpdate !== null) {
-            await this.providerUpdate;
+            await this.waitForProviderUpdate();
         }
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         logger.log("Loading session...", {sessionId: params.sessionId});
         // Captured before the load installs a fresh SessionState: a title
         // generation started by an earlier turn on this session belongs to the
@@ -872,9 +1201,23 @@ export class CodexAcpServer {
             modelState,
             modeState,
             thread,
+            history,
         } = await this.getOrCreateSessionWithHistory(params);
 
-        await this.streamThreadHistory(sessionId, thread);
+        try {
+            await this.streamThreadHistory(sessionId, thread, history);
+        } catch (err) {
+            // A close during the load already closed the session.
+            if (err instanceof SessionClosedDuringLoadError) {
+                throw RequestError.invalidRequest(`Session ${sessionId} is closing`);
+            }
+            // The history pages are read after the session is installed, so a failed read closes the
+            // session again. The client never gets a half-open session.
+            await this.closeSession({sessionId}).catch(closeError => {
+                logger.error(`Failed to close session ${sessionId} after a failed history read`, closeError);
+            });
+            throw this.recovery?.mapError(err) ?? err;
+        }
         await this.getSessionState(sessionId).asyncTasks.reconcile();
         // A load response means "the replay is complete"; a late rename echo
         // from a still-running title generation would arrive after it.
@@ -893,9 +1236,17 @@ export class CodexAcpServer {
     }
 
     async resumeSession(params: acp.ResumeSessionRequest): Promise<LegacyResumeSessionResponse> {
+        return this.recovery === null
+            ? await this.resumeSessionOnce(params)
+            : await this.recovery.trackOpen(params.sessionId, () => this.resumeSessionOnce(params));
+    }
+
+    private async resumeSessionOnce(params: acp.ResumeSessionRequest): Promise<LegacyResumeSessionResponse> {
         if (this.providerUpdate !== null) {
-            await this.providerUpdate;
+            await this.waitForProviderUpdate();
         }
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         logger.log("Resuming session...", {sessionId: params.sessionId});
         const [sessionId, modelState, modeState] = await this.getOrCreateSession(params);
 
@@ -913,8 +1264,10 @@ export class CodexAcpServer {
 
     async forkSession(params: acp.ForkSessionRequest): Promise<acp.ForkSessionResponse> {
         if (this.providerUpdate !== null) {
-            await this.providerUpdate;
+            await this.waitForProviderUpdate();
         }
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         logger.log("Forking session...", {sessionId: params.sessionId});
         try {
             const [sessionId, , modeState] = await this.tryCreateSession(params, "fork");
@@ -932,7 +1285,12 @@ export class CodexAcpServer {
     }
 
     async listSessions(params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         logger.log("Listing sessions...", {cwd: params.cwd, cursor: params.cursor});
+        if (this.sessionIndex.enabled) {
+            return await this.sessionIndex.list(params);
+        }
         await this.checkAuthorization();
         const response = await this.runWithProcessCheck(() => this.codexAcpClient.listSessions(params));
         return {
@@ -971,12 +1329,18 @@ export class CodexAcpServer {
                 await activePrompt.completion;
             }
 
-            await this.runWithProcessCheck(() => this.codexAcpClient.closeSession(params.sessionId));
+            if (this.recovery === null || this.recovery.isReady() && (!sessionState || this.recovery.sessionIsLive(sessionState))) {
+                await this.runWithProcessCheck(() => this.codexAcpClient.closeSession(params.sessionId));
+            } else {
+                // The thread is not loaded in a running app-server: nothing to close there, and no restart for it.
+                logger.log("Session closed without an app-server call: its app-server is gone", {sessionId: params.sessionId});
+            }
             logger.log("Session closed", {sessionId: params.sessionId});
         } finally {
             if (this.getSessionGeneration(params.sessionId) === closeGeneration) {
                 this.sessions.delete(params.sessionId);
-                this.pendingMcpStartupSessions.delete(params.sessionId);
+                this.mcpSessionStartup.close(params.sessionId);
+                this.codexAcpClient.appServerClient.mcpStartup.forgetThread(params.sessionId);
                 this.pendingTurnStarts.delete(params.sessionId);
                 this.activePrompts.delete(params.sessionId);
                 this.steeringQueues.delete(params.sessionId);
@@ -1005,6 +1369,8 @@ export class CodexAcpServer {
     }
 
     async deleteSession(params: acp.DeleteSessionRequest): Promise<acp.DeleteSessionResponse> {
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         logger.log("Deleting session...", {sessionId: params.sessionId});
         const sessionId = params.sessionId;
         const shouldCloseLocalSession = this.hasLocalSession(sessionId);
@@ -1017,7 +1383,11 @@ export class CodexAcpServer {
                 this.bumpSessionGeneration(sessionId);
             }
 
-            await this.runWithProcessCheck(() => this.codexAcpClient.deleteSession(sessionId));
+            if (this.sessionIndex.enabled) {
+                await this.sessionIndex.deleteThread(sessionId, shouldCloseLocalSession);
+            } else {
+                await this.runWithProcessCheck(() => this.codexAcpClient.deleteSession(sessionId));
+            }
             logger.log("Session deleted", {sessionId});
         } finally {
             this.endSessionCloseFence(sessionId);
@@ -1028,7 +1398,7 @@ export class CodexAcpServer {
 
     private hasLocalSession(sessionId: string): boolean {
         return this.sessions.has(sessionId)
-            || this.pendingMcpStartupSessions.has(sessionId)
+            || this.mcpSessionStartup.isPending(sessionId)
             || this.pendingTurnStarts.has(sessionId)
             || this.activePrompts.has(sessionId)
             || this.hasPendingSessionOpen(sessionId)
@@ -1043,8 +1413,10 @@ export class CodexAcpServer {
         params: acp.NewSessionRequest,
     ): Promise<LegacyNewSessionResponse> {
         if (this.providerUpdate !== null) {
-            await this.providerUpdate;
+            await this.waitForProviderUpdate();
         }
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         logger.log("Starting new session...");
         const [sessionId, modelState, modeState] = await this.getOrCreateSession(params);
 
@@ -1067,11 +1439,13 @@ export class CodexAcpServer {
         requestId?: acp.JsonRpcId,
     ): Promise<acp.AuthenticateResponse> {
         logger.log("Authenticate request received");
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         const elicitationRequester = this.createUrlElicitationRequester(requestId);
         const isAuthenticated = await this.runWithProcessCheck(() => this.codexAcpClient.authenticate(_params, elicitationRequester));
         if (!isAuthenticated) {
             logger.log("Authenticate request failed");
-            throw RequestError.invalidParams();
+            throw RequestError.authRequired({methodId: _params.methodId}, "Sign-in did not complete");
         }
         await this.refreshAuthState(this.getAuthProviderForAuthenticateRequest(_params));
         logger.log("Authenticate request completed");
@@ -1105,6 +1479,8 @@ export class CodexAcpServer {
 
     async logout(_params: acp.LogoutRequest): Promise<void> {
         logger.log("Logout request received");
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
         await this.runWithProcessCheck(() => this.codexAcpClient.logout());
         await this.refreshAuthState(null);
         logger.log("Logout request completed");
@@ -1154,33 +1530,61 @@ export class CodexAcpServer {
             }
             await replacement.initialize(this.initializeRequest);
             this.codexAcpClient = replacement;
+            this.sessionIndex.observe(replacement);
             this.availableCommands = this.createAvailableCommands(replacement);
 
             const resumeErrors: unknown[] = [];
+            this.recovery?.completeReplacement(replacement);
+            const replacementGeneration = this.recovery?.generation ?? 0;
             for (const session of this.sessions.values()) {
                 session.asyncTasks.setAppServer(replacement.appServerClient);
+                session.titleGen?.rebindAppServer(replacement.appServerClient);
+                if (replacement.appServerClient.connectionLoss.lost) {
+                    // The new app-server died: the next use of each session resumes it in the restarted one.
+                    break;
+                }
                 try {
-                    await replacement.resumeSession({
+                    const request = {
                         sessionId: session.sessionId,
                         cwd: session.cwd,
                         additionalDirectories: session.additionalDirectories,
                         mcpServers: session.mcpServers ?? [],
-                    });
+                    };
+                    const resume = (onSubscribed?: () => void) => onSubscribed === undefined
+                        ? replacement.resumeSession(request)
+                        : replacement.resumeSession(request, onSubscribed);
+                    await (this.recovery?.resumeForReplacement(session, replacementGeneration, replacement, resume) ?? resume());
                     session.authProvider = replacement.getModelProvider();
                     session.asyncTasks.refresh();
                     logger.log("Resumed session after provider restart", {sessionId: session.sessionId});
                 } catch (error) {
-                    resumeErrors.push(error);
+                    if (error instanceof ThreadRefusedError || error instanceof SessionReplacedError
+                        || error instanceof UnpersistedSessionLostError) {
+                        // A refused session stays not live and its next use reports the refusal; a session that closed
+                        // or opened again meanwhile needs no resume; a session without messages was never persisted,
+                        // so no app-server can resume it, and its next use reports the loss. None of them fails the
+                        // provider update, which applied to the agent and to every session that can go on.
+                        logger.log("Session not resumed after provider restart", {sessionId: session.sessionId, reason: String(error)});
+                        continue;
+                    }
+                    resumeErrors.push(this.recovery?.mapError(error, replacement) ?? error);
                     logger.error(`Failed to resume session ${session.sessionId} after provider restart`, error);
                 }
+            }
+            if (this.recovery !== null && !this.recovery.isReady(replacementGeneration)) {
+                // The new app-server died: report its exit, so requests that waited for the update restart it.
+                throw this.recovery.errorForGeneration(replacementGeneration);
             }
             if (resumeErrors.length > 0) {
                 throw new AggregateError(resumeErrors, `Failed to resume ${resumeErrors.length} session(s) after provider restart`);
             }
         });
         this.providerUpdate = update;
+        this.recovery?.settleReplacement(update);
         try {
             await update;
+        } catch (error) {
+            throw this.recovery?.mapError(error) ?? error;
         } finally {
             if (this.providerUpdate === update) {
                 this.providerUpdate = null;
@@ -1193,52 +1597,118 @@ export class CodexAcpServer {
         if (state === null || state.stderrProcess === state.connection.process) {
             return;
         }
-        state.stderrProcess = state.connection.process;
-        state.connection.process.stderr.addListener("data", (data: Buffer) => {
+        const process = state.connection.process;
+        state.stderrProcess = process;
+        process.stderr.addListener("data", (data: Buffer) => {
+            // Late output of an old app-server does not belong in the crash report of the new one.
+            if (state.connection.process !== process) return;
             state.stderr = (state.stderr + data.toString()).slice(-2 * 1024);
         });
     }
 
-    private observeCodexProcess(): void {
-        const process = this.codexProcessState?.connection.process;
-        if (!process) return;
-        const generation = ++this.codexProcessGeneration;
-        process.once("exit", () => {
-            if (generation !== this.codexProcessGeneration) return;
-            void this.finishAllAsyncTasks("failed", "after the Codex process exited");
-        });
-    }
-
     private async restartCodexClient(): Promise<CodexAcpClient> {
-        const state = this.codexProcessState;
-        if (state === null) {
+        if (this.recovery === null) {
             throw new Error("Codex process state is unavailable");
         }
+        return await this.recovery.beginReplacement();
+    }
 
-        const previous = state.connection;
-        this.codexProcessGeneration += 1;
-        const exited = previous.process.exitCode === null
-            ? once(previous.process, "exit")
-            : Promise.resolve();
-        previous.process.stdin.end();
-        const forceKill = setTimeout(() => {
-            if (previous.process.exitCode === null) {
-                logger.log("Codex still running 2s after provider restart; terminating process");
-                previous.process.kill();
-            }
-        }, 2000);
-        await exited;
-        clearTimeout(forceKill);
+    /**
+     * Waits for the provider update in flight. When its app-server died, the request goes on: the failure belongs to
+     * the `providers/set` request, and the request restarts the app-server itself. Any other failure fails it, as before.
+     */
+    private async waitForProviderUpdate(): Promise<void> {
+        try {
+            await this.providerUpdate;
+        } catch (error) {
+            const mapped = this.recovery?.mapError(error) ?? error;
+            if (!(mapped instanceof RequestError && mapped.code === CODEX_PROCESS_EXITED_ERROR_CODE)) throw error;
+            logger.log("A provider update failed because its app-server died; the request goes on", {error: String(error)});
+        }
+    }
 
-        state.stderr = "";
-        state.connection = startCodexConnection(state.codexPath);
-        this.captureStderr();
-        this.observeCodexProcess();
-        return new CodexAcpClient(
-            new CodexAppServerClient(state.connection.connection),
-            state.config,
-            state.modelProvider,
-        );
+    /**
+     * Starts the app-server again when it crashed. The entry points of user requests call it, see `AppServerRecovery`.
+     * Returns `undefined` when the app-server runs, so callers add no `await` on the normal path:
+     * `const appServer = this.ensureAppServer(); if (appServer) await appServer;`.
+     */
+    private ensureAppServer(): Promise<void> | undefined {
+        return this.recovery?.ensureRunning();
+    }
+
+    /** Resumes the thread of `sessionState` again when it was loaded in an app-server that died; see {@link ensureAppServer}. */
+    private ensureSessionReady(sessionState: SessionState): Promise<void> | undefined {
+        return this.recovery?.ensureSessionReady(sessionState);
+    }
+
+    /** Runs an operation of a prompt on the app-server of `generation`, never on a restarted one. */
+    private runOnAppServer<T>(generation: number, client: CodexAcpClient, operation: () => Promise<T>): Promise<T> {
+        try {
+            this.recovery?.throwIfLost(generation);
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        return this.runWithProcessCheck(operation, client);
+    }
+
+    private createRecovery(): AppServerRecovery<SessionState> | null {
+        const state = this.codexProcessState;
+        if (state === null) return null;
+        const supervisor = state.supervisor ?? new CodexAppServerSupervisor(state);
+        state.supervisor = supervisor;
+        return new AppServerRecovery<SessionState>({
+            supervisor,
+            currentClient: () => this.codexAcpClient,
+            createClient: (connection) => {
+                this.captureStderr();
+                return this.codexAcpClient.withAppServer(new CodexAppServerClient(connection.connection));
+            },
+            handshake: (client) => this.initializeRequest !== null && this.codexAcpClient.initialized
+                ? client.initialize(this.initializeRequest)
+                : null,
+            install: (client) => this.installCodexClient(client),
+            crashed: () => {
+                // Every session takes its tasks now, before any await, so a task that a restarted app-server starts
+                // meanwhile is not failed with the old ones.
+                for (const session of this.sessions.values()) {
+                    session.asyncTasks.finishAll("failed").catch(error => {
+                        logger.error("Failed to finish background terminal tasks after the Codex process exited", error);
+                    });
+                }
+            },
+            resumeSession: async (session, client, onSubscribed) => {
+                const metadata = await client.resumeSession({
+                    sessionId: session.sessionId,
+                    cwd: session.cwd,
+                    additionalDirectories: session.additionalDirectories,
+                    mcpServers: session.mcpServers ?? [],
+                }, onSubscribed);
+                return {collaborationMode: metadata.collaborationMode};
+            },
+            applyCollaborationMode: (session, client) =>
+                client.setCollaborationMode(session.sessionId, session.collaborationMode, session.currentModelId),
+            collaborationMode: (session) => session.collaborationMode,
+            resumed: (session) => session.asyncTasks.refresh(),
+            sessionLifetime: (session) => this.getSessionGeneration(session.sessionId),
+            isCurrent: (session, lifetime) => this.sessions.get(session.sessionId) === session
+                && this.getSessionGeneration(session.sessionId) === lifetime
+                && !this.sessionIsClosing(session.sessionId),
+            installedSession: (sessionId) => this.sessions.get(sessionId),
+        }, recoveryLimitsFromEnv());
+    }
+
+    /** Makes `client`, of a restarted app-server, the client of the agent and of every session. */
+    private installCodexClient(client: CodexAcpClient): void {
+        // A `providers/set` can have changed the routing of the old client while the restart ran.
+        client.adoptRoutingFrom(this.codexAcpClient);
+        this.codexAcpClient = client;
+        // The session index watches the thread notifications of the app-server that runs now.
+        this.sessionIndex.observe(client);
+        this.availableCommands = this.createAvailableCommands(client);
+        for (const session of this.sessions.values()) {
+            session.asyncTasks.setAppServer(client.appServerClient);
+            session.titleGen?.rebindAppServer(client.appServerClient);
+        }
     }
 
     /** Returns whether the auth state was read (and thus the auth status pushed). */
@@ -1295,12 +1765,22 @@ export class CodexAcpServer {
      * Never rejects: an unreadable source means "nothing to report", not an
      * error. The client then keeps showing the last pushed value, or "not
      * reported" when there was none.
+     *
+     * A read that failed because the login does not work, for example a revoked
+     * token, is an answer: it pushes the `none` status, see
+     * {@link isAccountReadAuthFailureError}.
      */
     private async publishAuthStatusRead(): Promise<void> {
         let authStatus: AuthStatus;
         try {
             authStatus = await this.readAgentAuthIdentity();
         } catch (error) {
+            if (isAccountReadAuthFailureError(error)) {
+                logger.log("The account read found that the agent needs a login", {error: String(error)});
+                this.lastReadAccount = null;
+                await this.setAuthStatus(fromAccount(null));
+                return;
+            }
             logger.log("Cannot determine auth status", {error: String(error)});
             return;
         }
@@ -1324,6 +1804,7 @@ export class CodexAcpServer {
             return gatewayStatus(modelProvider);
         }
         const accountResponse = await this.runWithProcessCheck(() => this.codexAcpClient.getAccount());
+        this.lastReadAccount = accountResponse.account;
         return fromAccount(accountResponse.account);
     }
 
@@ -1370,6 +1851,7 @@ export class CodexAcpServer {
      * invalidate; only a gateway logout or a provider change does.
      */
     private async applyAccountUpdated(notification: AccountUpdatedNotification): Promise<void> {
+        this.lastReadAccount = accountFromUpdated(notification, this.lastReadAccount);
         try {
             if (this.codexAcpClient.getAuthGatewayProviderName() !== null) {
                 return;
@@ -1402,6 +1884,7 @@ export class CodexAcpServer {
      * so no payload can equal it.
      */
     private async setAuthStatus(next: AuthStatus): Promise<void> {
+        this.authStatusVersion += 1;
         if (sameAuthStatus(this.currentAuthStatus, next)) {
             return;
         }
@@ -1496,7 +1979,12 @@ export class CodexAcpServer {
         if (mode === null) {
             throw RequestError.invalidParams();
         }
-        await this.codexAcpClient.setCollaborationMode(sessionState.sessionId, mode, sessionState.currentModelId);
+        if (this.recovery !== null && !this.recovery.sessionIsLive(sessionState)) {
+            // The thread is not loaded in a running app-server. Its resume applies the mode, see AppServerRecovery.
+            sessionState.collaborationMode = mode;
+            return;
+        }
+        await this.runWithProcessCheck(() => this.codexAcpClient.setCollaborationMode(sessionState.sessionId, mode, sessionState.currentModelId));
         sessionState.collaborationMode = mode;
     }
 
@@ -1541,7 +2029,9 @@ export class CodexAcpServer {
 
         const {model: requestedModelName, effort: requestedEffort} = ModelId.fromString(params.modelId);
 
-        const models = await this.codexAcpClient.fetchAvailableModels();
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
+        const models = await this.runWithProcessCheck(() => this.codexAcpClient.fetchAvailableModels());
         const model = models.find(m => m.id === requestedModelName);
         if (!model) throw new Error(`Unknown model ${params.modelId}`);
 
@@ -1926,7 +2416,7 @@ export class CodexAcpServer {
             ? sessionState.availableModels.find(model => model.isDefault)?.id
             : undefined;
         const configOptions = [
-            sessionState.agentMode.toConfigOption(),
+            sessionState.agentMode.toConfigOption(sessionState.clientCapabilities.airClient),
             createCollaborationModeConfigOption(sessionState.collaborationMode),
             createModelConfigOption(sessionState.availableModels, currentModelId.model, recommendedModelId),
         ];
@@ -2030,13 +2520,9 @@ export class CodexAcpServer {
             return;
         }
         sessionState.currentGoal = snapshot;
-        const session = new ACPSessionConnection(this.connection, sessionState.sessionId);
-        await session.update({
-            sessionUpdate: "session_info_update",
-            _meta: {
-                goal: snapshot,
-            },
-        });
+        const update = goalSessionInfoUpdate(snapshot, sessionState.clientCapabilities.airClient);
+        if (update === null) return;
+        await new ACPSessionConnection(this.connection, sessionState.sessionId).update(update);
     }
 
     private findCurrentModel(models: Model[], currentModelId: string): Model | undefined {
@@ -2066,23 +2552,51 @@ export class CodexAcpServer {
         modelState: LegacySessionModelState;
         modeState: SessionModeState;
         thread: Thread;
+        history: AsyncIterable<ThreadItem[]>;
     }> {
         const requestedSessionGeneration = this.beginSessionOpen(request.sessionId);
-        await this.checkAuthorization();
+        const loadStartedAt = performance.now();
+        const graceLeftMs = () => ACCOUNT_READ_LOAD_GRACE_MS - (performance.now() - loadStartedAt);
+        const authStatusVersionAtStart = this.authStatusVersion;
+        // The account read can wait for a network call of the app-server, so it runs while
+        // `thread/resume` reads the rollout. A login with the default auth request can change
+        // the provider of the resume, so the login keeps the order.
+        const authorization = this.defaultAuthRequest
+            ? Promise.resolve(await this.checkAuthorization())
+            : this.checkAuthorization();
+        // The load awaits the result below. This stops an unhandled rejection while `thread/resume` runs.
+        authorization.catch(() => {});
         const requestedMcpServers = request.mcpServers ?? [];
-        const mcpServerStartupVersion = requestedMcpServers.length > 0
+        const readMcpServerStartupVersion = () => requestedMcpServers.length > 0
             ? this.codexAcpClient.getMcpServerStartupVersion()
             : null;
+        let mcpServerStartupVersion = readMcpServerStartupVersion();
 
         logger.log(`Load existing session: ${request.sessionId}...`);
         let subscribed = false;
         let sessionMetadata: SessionMetadataWithThread;
+        let knownAccount: KnownAccount | "pending";
+        // The app-server that loads the thread, read in the closure that loads it. A crash after the load makes the
+        // session stale, see AppServerRecovery.
+        let openGeneration = this.recovery?.generation ?? 0;
         try {
-            sessionMetadata = await this.runWithProcessCheck(() =>
-                this.codexAcpClient.loadSession(request, () => {
-                    subscribed = true;
-                })
-            );
+            try {
+                const pendingResume = this.recovery?.settleResume(request.sessionId);
+                if (pendingResume) await pendingResume;
+                sessionMetadata = await this.runWithProcessCheck(() => {
+                    openGeneration = this.recovery?.generation ?? 0;
+                    mcpServerStartupVersion = readMcpServerStartupVersion();
+                    return this.codexAcpClient.loadSession(request, () => {
+                        subscribed = true;
+                    });
+                });
+            } catch (err) {
+                // An auth error that is known within the grace time comes first, as it did when the check ran
+                // before `thread/resume`. A read that is still pending does not hold back the resume error.
+                await settledWithin(authorization, graceLeftMs());
+                throw err;
+            }
+            knownAccount = await settledWithin(authorization, graceLeftMs());
         } catch (err) {
             if (subscribed) {
                 await this.cleanupStaleSessionOpen(request.sessionId, requestedSessionGeneration);
@@ -2094,7 +2608,7 @@ export class CodexAcpServer {
         const authProvider = sessionMetadata.modelProvider ?? this.codexAcpClient.getModelProvider();
         let authState: ActiveAuthState;
         try {
-            authState = await this.getAuthStateForProvider(authProvider);
+            authState = await this.getAuthStateForProvider(authProvider, knownAccount === "pending" ? "unavailable" : knownAccount);
         } catch (err) {
             if (subscribed) {
                 await this.cleanupStaleSessionOpen(request.sessionId, requestedSessionGeneration);
@@ -2119,6 +2633,8 @@ export class CodexAcpServer {
             currentTurnId: null,
             lastTokenUsage: null,
             totalTokenUsage: null,
+            promptTokenUsage: null,
+            threadHasHistory: true,
             modelContextWindow: null,
             rateLimits: null,
             account: authState.account,
@@ -2130,8 +2646,7 @@ export class CodexAcpServer {
             fastModeEnabled: sessionMetadata.currentServiceTier === "fast",
             currentModelSupportsFast: currentModelSupportsFast,
             sessionMcpServers: sessionMcpServers,
-            terminalOutputMode: this.terminalOutputMode,
-            terminalOutputDeltaSupported: this.terminalOutputDeltaSupported,
+            clientCapabilities: this.capabilities,
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: "unset",
@@ -2139,86 +2654,97 @@ export class CodexAcpServer {
                 sessionId,
                 clientSupportsSubagents(this.clientCapabilities),
                 new ACPSessionConnection(this.connection, sessionId),
+                childSessionId => this.reportingConnection.reports.releaseOpen(childSessionId),
             ),
             asyncTasks: this.createAsyncTasks(sessionId),
             compactions: new CodexSessionCompactions(),
+            toolCallReports: this.reportingConnection.reports,
         };
         sessionState.titleGen = new TitleGenerator(
             this.codexAcpClient.appServerClient,
             sessionId,
             sessionState.cwd,
             () => sessionState.sessionTitleSource,
+            this.sessionIndex.titleWriter(sessionId),
         );
         this.installSessionState(sessionState);
+        this.recovery?.markLoaded(sessionState, openGeneration);
+        if (knownAccount === "pending") {
+            this.applyLateAccountRead(sessionState, authorization, authStatusVersionAtStart);
+        }
         subscribed = false;
 
         if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
-            this.pendingMcpStartupSessions.set(
-                sessionId,
-                this.createPendingMcpStartupSession(requestedMcpServers, mcpServerStartupVersion),
-            );
-            this.publishMcpStartupStatusAsync(sessionId);
+            this.mcpSessionStartup.begin(sessionId, requestedMcpServers, mcpServerStartupVersion, {
+                publish: true,
+                skippedServers: sessionMetadata.skippedMcpServers,
+            });
         }
 
         await this.publishAvailableCommands(sessionState, requestedSessionGeneration);
         await this.publishCurrentGoalBestEffort(sessionState, requestedSessionGeneration, true);
         const sessionModelState: LegacySessionModelState = this.createModelState(models, currentModelId);
-        const sessionModeState: SessionModeState = sessionState.agentMode.toSessionModeState();
+        const sessionModeState: SessionModeState =
+            sessionState.agentMode.toSessionModeState(sessionState.clientCapabilities.airClient);
 
         return {
             sessionId: sessionId,
             modelState: sessionModelState,
             modeState: sessionModeState,
             thread: thread,
+            history: sessionMetadata.history,
         };
     }
 
-    private async streamThreadHistory(sessionId: string, thread: Thread): Promise<void> {
+    /**
+     * Sends the history of a loaded session one page of items at a time. The
+     * adapter keeps only the current page, not the whole history.
+     */
+    private async streamThreadHistory(sessionId: string, thread: Thread, history: AsyncIterable<ThreadItem[]>): Promise<void> {
         const session = new ACPSessionConnection(this.connection, sessionId);
         const sessionState = this.getSessionState(sessionId);
-        await this.publishThreadHistoryTitle(session, sessionState, thread);
+        const generation = this.getSessionGeneration(sessionId);
+        const isOpen = () => this.getSessionGeneration(sessionId) === generation;
+        const pages = history[Symbol.asyncIterator]();
+        const first = await pages.next();
+        const firstPage = first.done ? [] : first.value;
+        // The first user message of the first page names the session.
+        await this.publishThreadHistoryTitle(session, sessionState, thread, firstPage);
+        const itemPages = untilSessionClose(pagesStartingWith(firstPage, pages), isOpen);
         if (clientSupportsSubagents(this.clientCapabilities)) {
             await this.streamNativeThreadHistory(
                 sessionId,
-                thread,
+                itemPages,
                 sessionState,
                 new Set([sessionId]),
-                new Map([[sessionId, thread]]),
+                new Set(),
+                isOpen,
             );
             return;
         }
-        const responseItemFallbackUpdates = await createResponseItemHistoryFallbackUpdates(
-            thread,
-            sessionState.terminalOutputMode,
-        );
-
-        const threadUpdates: UpdateSessionEvent[] = [];
-        for (const turn of thread.turns) {
-            for (const item of turn.items) {
-                const updates = await this.createHistoryUpdates(item, sessionState);
-                threadUpdates.push(...updates);
+        for await (const items of itemPages) {
+            for (const item of items) {
+                if (!isOpen()) throw new SessionClosedDuringLoadError();
+                for (const update of await this.createHistoryUpdates(item, sessionState)) {
+                    await session.update(update);
+                }
             }
-        }
-
-        const updates = responseItemFallbackUpdates
-            ? mergeHistoryUpdates(responseItemFallbackUpdates, threadUpdates)
-            : threadUpdates;
-        for (const update of updates) {
-            await session.update(update);
         }
     }
 
     private async streamNativeThreadHistory(
         sessionId: string,
-        thread: Thread,
+        itemPages: AsyncIterable<ThreadItem[]>,
         sessionState: SessionState,
         ancestry: Set<string>,
-        threadCache: Map<string, Thread | null>,
+        unreadableChildren: Set<string>,
+        isOpen: () => boolean,
     ): Promise<void> {
         const session = new ACPSessionConnection(this.connection, sessionId);
         const announced = new Map<string, {generation: number; sessionId: string; terminal: boolean}>();
-        for (const turn of thread.turns) {
-            for (const item of turn.items) {
+        for await (const items of itemPages) {
+            for (const item of items) {
+                if (!isOpen()) throw new SessionClosedDuringLoadError();
                 if (item.type === "subAgentActivity") {
                     const activityKind = item.kind as string;
                     if (activityKind === "started") {
@@ -2237,33 +2763,40 @@ export class CodexAcpServer {
                             capabilities: {},
                         });
                         announced.set(item.agentThreadId, {generation, sessionId: childSessionId, terminal: false});
-                        if (!ancestry.has(item.agentThreadId)) {
-                            let child = threadCache.get(item.agentThreadId);
-                            if (child === undefined) {
+                        if (!ancestry.has(item.agentThreadId) && !unreadableChildren.has(item.agentThreadId)) {
+                            // Each generation of a child is one turn of the child thread. The
+                            // adapter reads only the items of that turn, one page at a time.
+                            let childItems: AsyncIterable<ThreadItem[]> | null = null;
+                            try {
+                                childItems = await this.codexAcpClient.readSessionTurnItems(item.agentThreadId, generation - 1);
+                            }
+                            catch (error) {
+                                unreadableChildren.add(item.agentThreadId);
+                                logger.error(`Failed to read subagent history ${item.agentThreadId}`, error);
+                            }
+                            if (childItems) {
+                                const commandIds = new Set<string>();
                                 try {
-                                    child = await this.codexAcpClient.readSessionThread(item.agentThreadId);
-                                    threadCache.set(item.agentThreadId, child);
+                                    await this.streamNativeThreadHistory(
+                                        childSessionId,
+                                        withCommandIds(untilSessionClose(childItems, isOpen), commandIds),
+                                        sessionState,
+                                        new Set([...ancestry, item.agentThreadId]),
+                                        unreadableChildren,
+                                        isOpen,
+                                    );
                                 }
                                 catch (error) {
-                                    threadCache.set(item.agentThreadId, null);
+                                    if (error instanceof SessionClosedDuringLoadError) throw error;
+                                    // The child pages are read lazily. A child that fails midway keeps what it sent.
+                                    unreadableChildren.add(item.agentThreadId);
                                     logger.error(`Failed to read subagent history ${item.agentThreadId}`, error);
-                                    child = null;
                                 }
-                            }
-                            const childTurn = child?.turns[generation - 1];
-                            if (child && childTurn) {
-                                await this.streamNativeThreadHistory(
-                                    childSessionId,
-                                    {...child, turns: [childTurn]},
-                                    sessionState,
-                                    new Set([...ancestry, item.agentThreadId]),
-                                    threadCache,
-                                );
                                 try {
                                     await sessionState.asyncTasks.recover(
                                         item.agentThreadId,
                                         childSessionId,
-                                        commandItemIds(childTurn.items),
+                                        commandIds,
                                     );
                                 } catch (error) {
                                     logger.error(`Failed to restore background terminals for ${item.agentThreadId}`, error);
@@ -2299,7 +2832,8 @@ export class CodexAcpServer {
                     }
                     continue;
                 }
-                if (item.type === "collabAgentToolCall") continue;
+                // The activity items above replay the lifecycle of a spawn. A control call is a tool call, as in the live session.
+                if (item.type === "collabAgentToolCall" && item.tool === "spawnAgent") continue;
                 for (const update of await this.createHistoryUpdates(item, sessionState)) {
                     await session.update(update);
                 }
@@ -2319,8 +2853,9 @@ export class CodexAcpServer {
         session: ACPSessionConnection,
         sessionState: SessionState,
         thread: Thread,
+        firstItems: ThreadItem[],
     ): Promise<void> {
-        const explicitTitle = this.normalizeSessionTitle(thread.name);
+        const explicitTitle = normalizeSessionTitle(thread.name);
         if (explicitTitle) {
             sessionState.sessionTitle = explicitTitle;
             sessionState.sessionTitleSource = "explicit";
@@ -2332,21 +2867,19 @@ export class CodexAcpServer {
             return;
         }
 
-        const historyTitle = this.findFirstUserMessageTitle(thread)
-            ?? this.normalizeSessionTitle(thread.preview);
+        const historyTitle = this.findFirstUserMessageTitle(firstItems)
+            ?? normalizeSessionTitle(thread.preview);
         await this.publishFallbackSessionTitle(sessionState, historyTitle);
     }
 
-    private findFirstUserMessageTitle(thread: Thread): string | null {
-        for (const turn of thread.turns) {
-            for (const item of turn.items) {
-                if (item.type !== "userMessage") continue;
-                const title = this.normalizeSessionTitle(item.content
-                    .filter((input): input is Extract<UserInput, {type: "text"}> => input.type === "text")
-                    .map(input => input.text)
-                    .join(" "));
-                if (title) return title;
-            }
+    private findFirstUserMessageTitle(items: ThreadItem[]): string | null {
+        for (const item of items) {
+            if (item.type !== "userMessage") continue;
+            const title = normalizeSessionTitle(item.content
+                .filter((input): input is Extract<UserInput, {type: "text"}> => input.type === "text")
+                .map(input => input.text)
+                .join(" "));
+            if (title) return title;
         }
         return null;
     }
@@ -2409,18 +2942,14 @@ export class CodexAcpServer {
     }
 
     private createPromptFallbackTitle(prompt: acp.ContentBlock[]): string | null {
-        return this.normalizeSessionTitle(prompt
+        return normalizeSessionTitle(prompt
             .filter((block): block is Extract<acp.ContentBlock, {type: "text"}> => block.type === "text")
             .map(block => block.text)
             .join(" "));
     }
 
-    private normalizeSessionTitle(title: string | null | undefined): string | null {
-        const normalized = title?.replace(/\s+/g, " ").trim() ?? "";
-        return normalized.length > 0 ? normalized : null;
-    }
-
     private async createHistoryUpdates(item: ThreadItem, sessionState: SessionState): Promise<UpdateSessionEvent[]> {
+        const renderer = new AcpToolCallRenderer(sessionState.clientCapabilities);
         switch (item.type) {
             case "userMessage":
                 return this.createUserMessageUpdates(item);
@@ -2429,9 +2958,9 @@ export class CodexAcpServer {
             case "sleep":
                 return [];
             case "subAgentActivity":
-                return [createSubAgentActivityUpdate(item, "completed", "tool_call")];
+                return [renderer.render(SubagentActivityReporter.activity(item, "completed", "start"))];
             case "agentMessage": {
-                const meta = createCodexMessagePhaseMeta(item.phase);
+                const meta = createMessagePhaseMeta(item.phase, sessionState.clientCapabilities.airClient);
                 return [{
                     sessionUpdate: "agent_message_chunk",
                     messageId: item.id,
@@ -2442,27 +2971,21 @@ export class CodexAcpServer {
             case "reasoning":
                 return this.createReasoningUpdates(item);
             case "fileChange":
-                return [await createFileChangeUpdate(item)];
-            case "commandExecution": {
-                const updates = [await createCommandExecutionUpdate(item)];
-                const completeUpdate = createCommandExecutionCompleteUpdate(item, sessionState.terminalOutputMode);
-                if (completeUpdate) {
-                    updates.push(completeUpdate);
-                }
-                return updates;
-            }
+                return [renderer.render(FileChangeReporter.started(item, renderer.capabilities.air.diffPatch))];
+            case "commandExecution":
+                return CommandReporter.history(item).map(facts => renderer.render(facts));
             case "mcpToolCall":
-                return [await createMcpToolCallUpdate(item)];
+                return [renderer.render(McpToolReporter.started(item))];
             case "dynamicToolCall":
-                return [await createDynamicToolCallUpdate(item)];
+                return [renderer.render(DynamicToolReporter.started(item))];
             case "collabAgentToolCall":
-                return [createCollabAgentToolCallUpdate(item)];
+                return [renderer.render(CollabAgentReporter.started(item))];
             case "webSearch":
-                return [this.createWebSearchUpdate(item)];
+                return [renderer.render(WebSearchReporter.history(item))];
             case "imageView":
-                return [createImageViewUpdate(item)];
+                return [renderer.render(ImageViewReporter.viewed(item))];
             case "imageGeneration":
-                return [createImageGenerationUpdate(item)];
+                return [renderer.render(ImageGenerationReporter.whole(item))];
             case "enteredReviewMode":
                 return [this.createReviewModeUpdate(item, true)];
             case "exitedReviewMode":
@@ -2470,7 +2993,7 @@ export class CodexAcpServer {
             case "contextCompaction":
                 return [clientSupportsCompaction(this.clientCapabilities)
                     ? createCompactionUpdate(item.id, "completed")
-                    : createCompletedContextCompactionUpdate(item)];
+                    : renderer.render(CompactionReporter.history(item))];
             case "plan":
                 return item.text.length > 0 ? [this.createPlanHistoryUpdate(item)] : [];
         }
@@ -2479,8 +3002,17 @@ export class CodexAcpServer {
     private createUserMessageUpdates(item: ThreadItem & { type: "userMessage" }): UpdateSessionEvent[] {
         const updates: UpdateSessionEvent[] = [];
         const messageId = item.id;
-        for (const input of item.content) {
-            const blocks = this.userInputToContentBlocks(input);
+        const contentBlocks = item.content.map(input => this.userInputToContentBlocks(input));
+        const attachmentUris = new Set(contentBlocks.flatMap((blocks, index) =>
+            item.content[index]?.type === "text"
+                ? blocks.flatMap(block => block.type === "resource_link" ? [block.uri] : [])
+                : []));
+        for (const [index, input] of item.content.entries()) {
+            const nativePath = input.type === "localImage" || input.type === "localAudio" || input.type === "mention"
+                ? input.path
+                : (input.type === "image" || input.type === "audio") && "url" in input ? input.url : null;
+            if (nativePath !== null && attachmentUris.has(attachmentFileUri(nativePath) ?? "")) continue;
+            const blocks = contentBlocks[index]!;
             for (const block of blocks) {
                 updates.push(createUserMessageChunk(block, messageId));
             }
@@ -2492,22 +3024,6 @@ export class CodexAcpServer {
         const parts = item.summary.length > 0 ? item.summary : item.content;
         const messageId = item.id;
         return parts.map((text) => createAgentTextThoughtChunk(text, messageId));
-    }
-
-    private createWebSearchUpdate(
-        item: ThreadItem & { type: "webSearch" }
-    ): UpdateSessionEvent {
-        return {
-            sessionUpdate: "tool_call",
-            toolCallId: item.id,
-            kind: "search",
-            title: formatWebSearchTitle(item),
-            status: "completed",
-            rawInput: {
-                query: item.query,
-                action: item.action,
-            },
-        };
     }
 
     private createReviewModeUpdate(
@@ -2526,7 +3042,7 @@ export class CodexAcpServer {
     private createPlanHistoryUpdate(
         item: ThreadItem & { type: "plan" }
     ): UpdateSessionEvent {
-        if (clientSupportsPlanUpdates(this.clientCapabilities)) {
+        if (this.capabilities.planUpdates) {
             return {
                 sessionUpdate: "plan_update",
                 plan: {
@@ -2539,14 +3055,15 @@ export class CodexAcpServer {
         return createAgentTextMessageChunk(
             item.text,
             item.id,
-            createCodexMessagePhaseMeta("final_answer"),
+            createMessagePhaseMeta("final_answer", this.capabilities.airClient),
         );
     }
 
     private userInputToContentBlocks(input: UserInput): acp.ContentBlock[] {
         switch (input.type) {
             case "text":
-                return input.text.length > 0 ? [{ type: "text", text: input.text }] : [];
+                return desktopAttachmentHistory(input.text)
+                    ?? (input.text.length > 0 ? [{ type: "text", text: input.text }] : []);
             case "image":
                 return [{
                     type: "text",
@@ -2554,17 +3071,20 @@ export class CodexAcpServer {
                         ? this.formatUriAsLink("image", input.url)
                         : `image:${input.fileId}`,
                 }];
-            case "localImage": {
-                const uri = input.path.startsWith("file://") ? input.path : `file://${input.path}`;
-                return [{ type: "text", text: this.formatUriAsLink(null, uri) }];
+            case "localImage":
+            case "localAudio":
+            case "mention": {
+                const uri = attachmentFileUri(input.path);
+                const fileName = input.path.split(/[\\/]/).pop() || input.type;
+                const name = input.type === "mention" && input.name.trim().length > 0 ? input.name : fileName;
+                return uri !== null
+                    ? [{type: "resource_link", name, uri}]
+                    : [{type: "text", text: this.formatUriAsLink(name, input.path)}];
             }
             case "skill":
                 return [{ type: "text", text: `skill:${input.name} (${input.path})` }];
             case "audio":
-            case "localAudio":
-            case "mention":
-                // These inputs are not currently represented in ACP history replay.
-                return [];
+                return [{type: "text", text: this.formatUriAsLink("audio", input.url)}];
         }
     }
 
@@ -2616,121 +3136,6 @@ export class CodexAcpServer {
         return [];
     }
 
-    private publishMcpStartupStatusAsync(sessionId: string): void {
-        void this.doPublishMcpStartupStatus(sessionId);
-    }
-
-    private createPendingMcpStartupSession(
-        mcpServers: Array<acp.McpServer>,
-        afterVersion: number,
-    ): PendingMcpStartupSession {
-        const requestedServers = new Set(getRequestedMcpServerNames(mcpServers));
-        return {
-            requestedServers,
-            startup: this.runWithProcessCheck(() =>
-                this.codexAcpClient.awaitMcpServerStartup(Array.from(requestedServers), afterVersion)
-            ),
-        };
-    }
-
-    private async doPublishMcpStartupStatus(sessionId: string): Promise<void> {
-        const pendingStartup = this.pendingMcpStartupSessions.get(sessionId);
-        if (!pendingStartup) {
-            return;
-        }
-
-        try {
-            const mcpStartup = await pendingStartup.startup;
-            if (!this.sessions.has(sessionId)
-                || this.sessionIsClosing(sessionId)
-                || this.pendingMcpStartupSessions.get(sessionId) !== pendingStartup) {
-                return;
-            }
-            await this.publishMcpStartupStatus(sessionId, mcpStartup, pendingStartup.requestedServers);
-        } catch (err) {
-            logger.error(`Failed to publish MCP startup status for session ${sessionId}`, err);
-        } finally {
-            if (this.pendingMcpStartupSessions.get(sessionId) === pendingStartup) {
-                this.pendingMcpStartupSessions.delete(sessionId);
-            }
-        }
-    }
-
-    private async publishMcpStartupStatus(
-        sessionId: string,
-        mcpStartup: McpStartupResult,
-        requestedServers?: Set<string>
-    ): Promise<void> {
-        const filteredStartup = requestedServers
-            ? {
-                ready: mcpStartup.ready.filter(server => requestedServers.has(server)),
-                failed: mcpStartup.failed.filter(server => requestedServers.has(server.server)),
-                cancelled: mcpStartup.cancelled.filter(server => requestedServers.has(server)),
-            }
-            : mcpStartup;
-
-        const failuresAfterOauth: typeof filteredStartup.failed = [];
-        const readyAfterOauth = [...filteredStartup.ready];
-        for (const failure of filteredStartup.failed) {
-            if (failure.failureReason !== "reauthenticationRequired"
-                || !clientSupportsUrlElicitation(this.clientCapabilities)) {
-                failuresAfterOauth.push(failure);
-                continue;
-            }
-            try {
-                const authenticated = await this.authenticateMcpServer(sessionId, failure.server);
-                if (authenticated) {
-                    readyAfterOauth.push(failure.server);
-                } else {
-                    failuresAfterOauth.push(failure);
-                }
-            } catch (error) {
-                logger.error(`Failed to authenticate MCP server ${failure.server}`, error);
-                failuresAfterOauth.push(failure);
-            }
-        }
-
-        for (const update of CodexEventHandler.createMcpStartupUpdates({
-            ...filteredStartup,
-            ready: readyAfterOauth,
-            failed: failuresAfterOauth,
-        })) {
-            await this.connection.notify(acp.methods.client.session.update, {
-                sessionId,
-                update,
-            });
-        }
-    }
-
-    private async authenticateMcpServer(sessionId: string, serverName: string): Promise<boolean> {
-        const elicitationId = `mcp-oauth-${randomUUID()}`;
-        const completed = this.codexAcpClient.awaitMcpServerOauthLoginCompleted(serverName, sessionId);
-        const login = await this.codexAcpClient.mcpServerOauthLogin({
-            name: serverName,
-            threadId: sessionId,
-        });
-        const elicitation = Promise.resolve(this.connection.request(
-            acp.methods.client.elicitation.create,
-            {
-                mode: "url",
-                sessionId,
-                message: `Authenticate with MCP server ${serverName}`,
-                url: login.authorizationUrl,
-                elicitationId,
-            },
-        ));
-        const first = await Promise.race([
-            completed.then(result => ({type: "completed" as const, result})),
-            elicitation.then(response => ({type: "elicitation" as const, response})),
-        ]);
-        if (first.type === "elicitation" && !acp.CreateElicitationResponse.isAccept(first.response)) {
-            return false;
-        }
-        const result = first.type === "completed" ? first.result : await completed;
-        await this.connection.notify(acp.methods.client.elicitation.complete, {elicitationId});
-        return result.success;
-    }
-
     private trackActivePrompt(sessionId: string): ActivePrompt {
         let resolveCompletion: () => void = () => {};
         const completion = new Promise<void>((resolve) => {
@@ -2745,6 +3150,10 @@ export class CodexAcpServer {
             resolveCancelSignal = resolve;
         });
         const abortController = new AbortController();
+        let resolveClientCancelSignal: (value: null) => void = () => {};
+        const clientCancelSignal = new Promise<null>((resolve) => {
+            resolveClientCancelSignal = resolve;
+        });
 
         let completed = false;
         let closeRequested = false;
@@ -2778,6 +3187,12 @@ export class CodexAcpServer {
                     this.activePrompts.delete(sessionId);
                 }
                 resolveCompletion();
+            },
+            clientCancelled: false,
+            clientCancelSignal,
+            requestClientCancel: () => {
+                activePrompt.clientCancelled = true;
+                resolveClientCancelSignal(null);
             },
         };
 
@@ -2855,6 +3270,11 @@ export class CodexAcpServer {
         turn: { threadId: string, turnId: string },
         requestName: "Cancel" | "Close",
     ): Promise<void> {
+        if (this.recovery !== null && !this.turnAppServerIsLive(turn.threadId)) {
+            // The turn died with its app-server. A restarted app-server has no such turn.
+            logger.log(`${requestName} - turnInterrupt skipped: the app-server of the turn is gone`, {sessionId: turn.threadId});
+            return;
+        }
         for (let attempt = 0; ; attempt++) {
             try {
                 await this.runWithProcessCheck(() => this.codexAcpClient.turnInterrupt({
@@ -2890,6 +3310,12 @@ export class CodexAcpServer {
                 await new Promise(resolve => setTimeout(resolve, retryDelay));
             }
         }
+    }
+
+    private turnAppServerIsLive(threadId: string): boolean {
+        if (this.recovery === null) return true;
+        const sessionState = this.sessions.get(threadId);
+        return sessionState === undefined ? this.recovery.isReady() : this.recovery.sessionIsLive(sessionState);
     }
 
     private interruptLateStartedTurn(turn: { threadId: string, turnId: string }): void {
@@ -2964,7 +3390,7 @@ export class CodexAcpServer {
         onTurnStarted?: () => void,
     ): Promise<acp.PromptResponse> {
         if (this.providerUpdate !== null) {
-            await this.providerUpdate;
+            await this.waitForProviderUpdate();
         }
         logger.log("Prompt received", {
             sessionId: params.sessionId,
@@ -2982,6 +3408,8 @@ export class CodexAcpServer {
         let promptWasCancelled = false;
         let recoverableSessionFailure = sessionState.sessionFailure;
         sessionState.currentTurnId = null;
+        // A prompt that starts no model work, such as /status or a cancellation before the turn, used no tokens.
+        sessionState.promptTokenUsage = null;
         const activePrompt = this.trackActivePrompt(params.sessionId);
         let pendingTurnStart: PendingTurnStart | null = null;
         const ensurePendingTurnStart = (): PendingTurnStart => {
@@ -2994,6 +3422,19 @@ export class CodexAcpServer {
         const disposePromptRequestCancellation = this.observePromptRequestCancellation(signal, sessionState, activePrompt);
         let eventHandler: CodexEventHandler | null = null;
         let promptNotificationsActive = true;
+        // The app-server of this prompt. A restart during the prompt must not mix clients, see AppServerRecovery.
+        let promptClient = this.codexAcpClient;
+        let promptCommands = this.availableCommands;
+        let promptGeneration = this.recovery?.generation ?? 0;
+        const appServerLost = new AbortController();
+        let removeAppServerLossListener: () => void = () => {};
+        let promptElicitations: CodexElicitationHandler | null = null;
+        const interactionConnection = this.recovery === null
+            ? this.connection
+            : lossAwareConnection(this.connection, appServerLost.signal);
+        const subagentWaitSignal = this.recovery === null
+            ? activePrompt.signal
+            : AbortSignal.any([activePrompt.signal, appServerLost.signal]);
         const clearRecoveredSessionFailure = async (handler: CodexEventHandler): Promise<void> => {
             await handler.completeSuccessfulTurn(sessionState.currentTurnId);
             const current = sessionState.sessionFailure;
@@ -3012,10 +3453,33 @@ export class CodexAcpServer {
         };
 
         try {
+            const sessionReady = this.recovery?.ensureSessionReady(sessionState);
+            if (sessionReady) {
+                // A resume of a large session can take long: a cancel or close during it ends the prompt.
+                const readiness = sessionReady.then(() => true);
+                readiness.catch(() => undefined);
+                const ready = await Promise.race([
+                    readiness,
+                    activePrompt.closeSignal.then(() => false),
+                    activePrompt.cancelSignal.then(() => false),
+                    activePrompt.clientCancelSignal.then(() => false),
+                ]);
+                if (!ready) {
+                    return cancelledPromptResponse();
+                }
+            }
+            if (activePrompt.clientCancelled) {
+                return cancelledPromptResponse();
+            }
+            if (this.recovery !== null) {
+                promptClient = this.codexAcpClient;
+                promptCommands = this.availableCommands;
+                promptGeneration = this.recovery.generation;
+                removeAppServerLossListener = this.recovery.onGenerationLost(promptGeneration, () => appServerLost.abort());
+            }
             const promptEventHandler = new CodexEventHandler(
                 this.connection,
                 sessionState,
-                clientSupportsPlanUpdates(this.clientCapabilities),
                 clientSupportsTypedSessionFailures(this.clientCapabilities),
                 this.sessionFailureEpoch,
                 sessionState.subagents,
@@ -3027,22 +3491,26 @@ export class CodexAcpServer {
             eventHandler = promptEventHandler;
             const permissionLifecycle = this.permissionLifecycleContext(sessionState);
             const permissionContext = permissionLifecycle.beginPrompt();
+            const toolCallRenderer = new AcpToolCallRenderer(this.capabilities);
             const approvalHandler = new CodexApprovalHandler(
-                this.connection,
+                interactionConnection,
                 permissionContext,
                 activePrompt.signal,
+                toolCallRenderer,
             );
             const elicitationHandler = new CodexElicitationHandler(
-                this.connection,
+                interactionConnection,
                 permissionContext,
                 this.clientCapabilities,
                 activePrompt.signal,
+                toolCallRenderer,
             );
+            promptElicitations = elicitationHandler;
             const observeInteraction = async (event: ServerNotification): Promise<void> => {
                 permissionContext.handleNotification(event);
                 await elicitationHandler.handleNotification(event);
             };
-            await this.codexAcpClient.subscribeToSessionEvents(params.sessionId,
+            await promptClient.subscribeToSessionEvents(params.sessionId,
                 async (event) => {
                     await observeInteraction(event);
                     if (!promptNotificationsActive) {
@@ -3069,9 +3537,10 @@ export class CodexAcpServer {
                 return cancelledPromptResponse();
             }
 
-            const commandPromise = this.availableCommands.tryHandleCommand(params.prompt, sessionState, {
+            const commandPromise = promptCommands.tryHandleCommand(params.prompt, sessionState, {
+                signal: activePrompt.signal,
                 onTurnStartPending: () => {
-                    sessionState.lastTokenUsage = null;
+                    this.beginPromptTokenUsage(sessionState);
                     ensurePendingTurnStart();
                 },
                 onTurnStarted: (turnId, threadId) => {
@@ -3114,7 +3583,7 @@ export class CodexAcpServer {
             if (commandResult.handled) {
                 promptNotificationsActive = false;
                 logger.log("Prompt handled by a command");
-                await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+                await promptClient.waitForSessionNotifications(params.sessionId);
                 await eventHandler.flushPendingErrors();
                 await eventHandler.flushPendingErrorsAsSessionScoped();
                 if (commandResult.turnCompleted) {
@@ -3144,7 +3613,7 @@ export class CodexAcpServer {
                 await clearRecoveredSessionFailure(eventHandler);
                 return {
                     stopReason: "end_turn",
-                    usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+                    usage: this.buildPromptUsage(sessionState),
                     _meta: this.buildQuotaMeta(sessionState),
                 };
             }
@@ -3177,10 +3646,10 @@ export class CodexAcpServer {
                 sessionState.fastModeEnabled,
                 sessionState.currentModelSupportsFast,
             );
-            sessionState.lastTokenUsage = null;
+            this.beginPromptTokenUsage(sessionState);
             ensurePendingTurnStart();
-            const sendPromptPromise = this.runWithProcessCheck(
-                () => this.codexAcpClient.sendPrompt(
+            const sendPromptPromise = this.runOnAppServer(promptGeneration, promptClient,
+                () => promptClient.sendPrompt(
                     effectiveParams,
                     agentMode,
                     modelId,
@@ -3216,11 +3685,12 @@ export class CodexAcpServer {
                 return cancelledPromptResponse();
             }
 
-            await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+            await promptClient.waitForSessionNotifications(params.sessionId);
             if (turnCompleted.turn.status === "completed") {
-                await eventHandler.waitForNativeSubagents(activePrompt.signal);
+                await eventHandler.waitForNativeSubagents(subagentWaitSignal);
                 if (activePrompt.signal.aborted) return cancelledPromptResponse();
-                await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+                this.throwIfSubagentWaitLost(appServerLost.signal, sessionState, promptGeneration);
+                await promptClient.waitForSessionNotifications(params.sessionId);
             }
             else {
                 await eventHandler.finishOutstandingNativeSubagents(
@@ -3261,6 +3731,7 @@ export class CodexAcpServer {
                     sessionState,
                     completedPlan,
                     activePrompt.signal,
+                    interactionConnection,
                 );
                 if (this.promptShouldStop(params.sessionId, activePrompt)) {
                     return cancelledPromptResponse();
@@ -3279,8 +3750,8 @@ export class CodexAcpServer {
                     };
                     activePrompt.currentTurn = null;
                     sessionState.currentTurnId = null;
-                    const implementationPromise = this.runWithProcessCheck(
-                        () => this.codexAcpClient.sendPrompt(
+                    const implementationPromise = this.runOnAppServer(promptGeneration, promptClient,
+                        () => promptClient.sendPrompt(
                             implementationRequest,
                             agentMode,
                             modelId,
@@ -3319,11 +3790,12 @@ export class CodexAcpServer {
                         return cancelledPromptResponse();
                     }
 
-                    await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+                    await promptClient.waitForSessionNotifications(params.sessionId);
                     if (turnCompleted.turn.status === "completed") {
-                        await eventHandler.waitForNativeSubagents(activePrompt.signal);
+                        await eventHandler.waitForNativeSubagents(subagentWaitSignal);
                         if (activePrompt.signal.aborted) return cancelledPromptResponse();
-                        await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+                        this.throwIfSubagentWaitLost(appServerLost.signal, sessionState, promptGeneration);
+                        await promptClient.waitForSessionNotifications(params.sessionId);
                     }
                     else {
                         await eventHandler.finishOutstandingNativeSubagents(
@@ -3358,6 +3830,14 @@ export class CodexAcpServer {
 
             await clearRecoveredSessionFailure(eventHandler);
 
+            // Codex sends no notification for a new skill file. A skill that appeared during the turn becomes a
+            // slash command after it. Never await: the prompt response does not wait for the skill list.
+            void this.availableCommands.publish(
+                sessionState,
+                () => this.sessions.get(sessionState.sessionId) === sessionState,
+                true,
+            );
+
             // Fire-and-forget: generate an AI title from the first turn.
             // Never await — must not block the prompt response.
             // Note: turn.items contains only agent output, not the user message —
@@ -3378,18 +3858,35 @@ export class CodexAcpServer {
 
             return {
                 stopReason: "end_turn",
-                usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+                usage: this.buildPromptUsage(sessionState),
                 _meta: this.buildQuotaMeta(sessionState),
             };
-        } catch (err) {
+        } catch (caught) {
+            const err = this.recovery?.mapError(caught, promptClient) ?? caught;
             logger.error(`Prompt for session ${params.sessionId} failed`, err);
+            const lostAppServer = this.recovery !== null
+                && err instanceof RequestError
+                && err.code === CODEX_PROCESS_EXITED_ERROR_CODE;
             if (activePrompt.signal.aborted || this.sessionIsClosing(params.sessionId)) {
+                if (lostAppServer) await this.finishPromptAfterAppServerLoss(sessionState, eventHandler, promptClient, promptElicitations, "cancelled");
                 return cancelledPromptResponse();
             }
             agentFileChangeReportTurnId = null;
             agentFileChangeReportUnavailableReason = "providerError";
             const isProcessExit = err instanceof RequestError
                 && err.code === CODEX_PROCESS_EXITED_ERROR_CODE;
+            if (lostAppServer) {
+                // ACP: a prompt that the client cancelled answers `cancelled`, also when the app-server died meanwhile.
+                if (activePrompt.clientCancelled) {
+                    await this.finishPromptAfterAppServerLoss(sessionState, eventHandler, promptClient, promptElicitations, "cancelled");
+                    return cancelledPromptResponse();
+                }
+                await this.finishPromptAfterAppServerLoss(sessionState, eventHandler, promptClient, promptElicitations, "failed");
+                // A cancel that came while the cleanup published still wins (ACP: a cancelled prompt answers `cancelled`).
+                if (activePrompt.clientCancelled || activePrompt.signal.aborted) {
+                    return cancelledPromptResponse();
+                }
+            }
             const isUnexpectedFailure = !(err instanceof RequestError);
             if (eventHandler !== null
                 && clientSupportsTypedSessionFailures(this.clientCapabilities)
@@ -3414,7 +3911,7 @@ export class CodexAcpServer {
             // awaiting disposal so queued late notifications cannot enter prompt-local buffers.
             promptNotificationsActive = false;
             try {
-                await this.codexAcpClient.waitForSessionNotifications(params.sessionId);
+                await promptClient.waitForSessionNotifications(params.sessionId);
                 await eventHandler?.finishOutstandingNativeSubagents(
                     promptWasCancelled || activePrompt.signal.aborted || this.sessionIsClosing(params.sessionId)
                         ? "cancelled"
@@ -3446,6 +3943,7 @@ export class CodexAcpServer {
             logger.log("Prompt completed", {sessionId: params.sessionId});
             await eventHandler?.dispose();
             disposePromptRequestCancellation();
+            removeAppServerLossListener();
             sessionState.currentTurnId = null;
             const registeredPendingTurnStart = this.pendingTurnStarts.get(params.sessionId);
             if (registeredPendingTurnStart !== undefined) {
@@ -3460,37 +3958,81 @@ export class CodexAcpServer {
         sessionState: SessionState,
         plan: CompletedPlan,
         cancellationSignal: AbortSignal,
+        connection: AcpClientConnection = this.connection,
     ): Promise<boolean> {
-        const toolCallId = planImplementationToolCallId(plan);
+        const renderer = new AcpToolCallRenderer(sessionState.clientCapabilities);
         try {
-            const response = await this.connection.request(
+            const response = await connection.request(
                 acp.methods.client.session.requestPermission,
-                planImplementationPermissionRequest(sessionState.sessionId, plan),
+                PlanReviewReporter.permissionRequest(sessionState.sessionId, plan, renderer),
                 {cancellationSignal},
             );
-            const approved = planImplementationApproved(response);
+            const approved = PlanReviewReporter.approved(response);
             await this.connection.notify(acp.methods.client.session.update, {
                 sessionId: sessionState.sessionId,
-                update: {
-                    sessionUpdate: "tool_call_update",
-                    toolCallId,
-                    status: "completed",
-                    rawOutput: approved
-                        ? "User approved the plan."
-                        : "User kept the session in plan mode.",
-                },
+                update: renderer.render(PlanReviewReporter.decided(plan, approved)),
             });
             return approved;
         } catch (error) {
+            // The app-server died while the dialog was open: the prompt fails with its exit, see LossAwareConnection.
+            if (error instanceof AppServerConnectionLostError) throw error;
             logger.error("Error requesting plan implementation permission", error);
             return false;
+        }
+    }
+
+    /**
+     * The wait for native subagents ended because the app-server died while some still ran: the prompt fails with the
+     * exit. A turn that completed before the app-server died, with no subagent left, still ends normally.
+     */
+    private throwIfSubagentWaitLost(lost: AbortSignal, sessionState: SessionState, generation: number): void {
+        if (this.recovery === null || !lost.aborted || !sessionState.subagents.hasOutstanding()) return;
+        throw this.recovery.errorForGeneration(generation);
+    }
+
+    /**
+     * Ends what a prompt showed as running when its app-server died: open tool calls of the session and of its native
+     * subagent sessions, the subagent sessions themselves and compactions. Nothing will ever complete them.
+     */
+    private async finishPromptAfterAppServerLoss(
+        sessionState: SessionState,
+        eventHandler: CodexEventHandler | null,
+        promptClient: CodexAcpClient,
+        elicitations: CodexElicitationHandler | null,
+        state: "failed" | "cancelled",
+    ): Promise<void> {
+        try {
+            await elicitations?.completeAllUrlElicitations();
+            const sessionIds = new Set([sessionState.sessionId, ...sessionState.subagents.childSessionIds()]);
+            await this.failUnfinishedToolCalls(sessionIds);
+            // Ending the subagent sessions also ends the waits of queued notifications for them. The dead app-server
+            // sends nothing more, so the queue then drains. A tool call or a subagent session that the queue still
+            // starts is failed and ended in a second pass.
+            await eventHandler?.finishOutstandingNativeSubagents(state);
+            await promptClient.waitForSessionNotifications(sessionState.sessionId);
+            for (const childSessionId of sessionState.subagents.childSessionIds()) sessionIds.add(childSessionId);
+            await this.failUnfinishedToolCalls(sessionIds);
+            await eventHandler?.finishOutstandingNativeSubagents(state);
+        } catch (error) {
+            logger.error("Failed to finish the tool calls of a prompt whose app-server died", error);
+        }
+    }
+
+    private async failUnfinishedToolCalls(sessionIds: Iterable<string>): Promise<void> {
+        for (const sessionId of sessionIds) {
+            for (const toolCallId of this.reportingConnection.reports.unfinished(sessionId)) {
+                await this.connection.notify(acp.methods.client.session.update, {
+                    sessionId,
+                    update: {sessionUpdate: "tool_call_update", toolCallId, status: "failed"},
+                });
+            }
         }
     }
 
     private cancelledPromptResponse(sessionState: SessionState): acp.PromptResponse {
         return {
             stopReason: "cancelled",
-            usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+            usage: this.buildPromptUsage(sessionState),
             _meta: this.buildQuotaMeta(sessionState),
         };
     }
@@ -3507,7 +4049,7 @@ export class CodexAcpServer {
         }
         return {
             stopReason: "end_turn",
-            usage: this.buildPromptUsage(sessionState.lastTokenUsage),
+            usage: this.buildPromptUsage(sessionState),
             _meta: {
                 ...this.buildQuotaMeta(sessionState),
                 ...failureMeta,
@@ -3515,36 +4057,51 @@ export class CodexAcpServer {
         };
     }
 
+    /** `_meta.quota`: the usage of the whole prompt, the same counts as {@link buildPromptUsage}. */
     private buildQuotaMeta(sessionState: SessionState): { quota: QuotaMeta } {
-        const lastTokenUsage = sessionState.lastTokenUsage;
+        const promptTokenUsage = sessionState.promptTokenUsage?.usage() ?? null;
 
         // Remove the "[reasoning-level]" suffix from currentModelId if present
         const modelName = sessionState.currentModelId.replace(/\[.*?]$/, '');
 
         // FIXME: currently all tokens are reported for the current model
-        const modelUsage = (lastTokenUsage != null)
-            ? [{ model: modelName, token_count: lastTokenUsage }]
+        const modelUsage = (promptTokenUsage != null)
+            ? [{ model: modelName, token_count: promptTokenUsage }]
             : [];
 
         return {
             quota: {
-                token_count: sessionState.lastTokenUsage,
+                token_count: promptTokenUsage,
                 model_usage: modelUsage
             }
         };
     }
 
-    private buildPromptUsage(lastTokenUsage: TokenCount | null): acp.Usage | null {
-        if (lastTokenUsage == null) {
-            return null;
-        }
-        return toPromptUsage(lastTokenUsage);
+    private beginPromptTokenUsage(sessionState: SessionState): void {
+        sessionState.lastTokenUsage = null;
+        // A new thread starts at zero; the usage of a thread with history is unknown until Codex reports it.
+        const startTotal = sessionState.totalTokenUsage
+            ?? (sessionState.threadHasHistory ? null : ZERO_TOKEN_COUNT);
+        sessionState.promptTokenUsage = new PromptTokenUsage(startTotal);
     }
 
-    private async runWithProcessCheck<T>(operation: () => Promise<T>): Promise<T> {
+    private buildPromptUsage(sessionState: SessionState): acp.Usage | null {
+        const usage = sessionState.promptTokenUsage?.usage() ?? null;
+        return usage === null ? null : toPromptUsage(usage);
+    }
+
+    /**
+     * Runs an app-server operation and maps a failure because the app-server is gone to a clear error.
+     * It never starts the app-server again: the entry points of user requests do that, see {@link ensureAppServer}.
+     * `client` is the client that the operation uses, by default the installed one at the call.
+     */
+    private async runWithProcessCheck<T>(operation: () => Promise<T>, client = this.codexAcpClient): Promise<T> {
         try {
             return await operation();
         } catch (err) {
+            if (this.recovery !== null) {
+                throw this.recovery.mapError(err, client);
+            }
             const exitCode = this.getExitCode();
             const requestErrorCode = CODEX_PROCESS_EXITED_ERROR_CODE;
             if (exitCode == 3221225781) {
@@ -3572,6 +4129,7 @@ export class CodexAcpServer {
 
     async cancel(params: acp.CancelNotification): Promise<void> {
         this.abortGuardedTtyExecutions(params.sessionId, "cancelled");
+        this.activePrompts.get(params.sessionId)?.requestClientCancel();
         const sessionState = this.sessions.get(params.sessionId);
         if (!sessionState) {
             logger.log("Cancel request rejected: session not found", {sessionId: params.sessionId});
@@ -3583,97 +4141,27 @@ export class CodexAcpServer {
     }
 }
 
-function mergeHistoryUpdates(
-    responseItemFallbackUpdates: UpdateSessionEvent[],
-    threadUpdates: UpdateSessionEvent[],
-): UpdateSessionEvent[] {
-    const merged: UpdateSessionEvent[] = [];
-    const seen = new Set<string>();
-    let fallbackIndex = 0;
-
-    const pushUpdate = (update: UpdateSessionEvent) => {
-        const key = historyUpdateKey(update);
-        if (key && seen.has(key)) {
-            return;
-        }
-        if (key) {
-            seen.add(key);
-        }
-        merged.push(update);
-    };
-
-    const flushFallbackBeforeMatchingDuplicate = (targetUpdate: UpdateSessionEvent): void => {
-        const targetKey = historyUpdateKey(targetUpdate);
-        const targetContentKey = historyUpdateContentKey(targetUpdate);
-        if (!targetKey && !targetContentKey) {
-            return;
-        }
-
-        const matchIndex = responseItemFallbackUpdates.findIndex((update, index) => (
-            index >= fallbackIndex
-            && (
-                (targetKey !== null && historyUpdateKey(update) === targetKey)
-                || (targetContentKey !== null && historyUpdateContentKey(update) === targetContentKey)
-            )
-        ));
-        if (matchIndex === -1) {
-            return;
-        }
-
-        while (fallbackIndex < matchIndex) {
-            pushUpdate(responseItemFallbackUpdates[fallbackIndex]!);
-            fallbackIndex += 1;
-        }
-        fallbackIndex += 1;
-    };
-
-    for (const update of threadUpdates) {
-        flushFallbackBeforeMatchingDuplicate(update);
-        pushUpdate(update);
-    }
-
-    while (fallbackIndex < responseItemFallbackUpdates.length) {
-        pushUpdate(responseItemFallbackUpdates[fallbackIndex]!);
-        fallbackIndex += 1;
-    }
-
-    return merged;
-}
-
-function commandItemIds(items: ThreadItem[]): Set<string> {
-    return new Set(items
-        .filter((item): item is Extract<ThreadItem, {type: "commandExecution"}> => item.type === "commandExecution")
-        .map(item => item.id));
-}
-
-function historyUpdateKey(update: UpdateSessionEvent): string | null {
-    switch (update.sessionUpdate) {
-        case "user_message_chunk":
-        case "agent_message_chunk":
-        case "agent_thought_chunk":
-            return `${update.sessionUpdate}:${update.messageId ?? ""}:${JSON.stringify(update.content)}`;
-        case "tool_call":
-            return `tool_call:${update.toolCallId}:start`;
-        case "tool_call_update":
-            return `tool_call:${update.toolCallId}:update`;
-        default:
-            return null;
+/** A close of the session stopped the read of its history during `session/load`. */
+class SessionClosedDuringLoadError extends Error {
+    constructor() {
+        super("The session closed during the history load");
     }
 }
 
-function historyUpdateContentKey(update: UpdateSessionEvent): string | null {
-    switch (update.sessionUpdate) {
-        case "user_message_chunk":
-        case "agent_message_chunk":
-        case "agent_thought_chunk":
-            return `${update.sessionUpdate}:${JSON.stringify(update.content)}`;
-        default:
-            return historyUpdateKey(update);
+/** The pages of `pages` while `isOpen` is true. A close of the session stops the read at the next page. */
+async function* untilSessionClose<T>(pages: AsyncIterable<T[]>, isOpen: () => boolean): AsyncGenerator<T[]> {
+    for await (const page of pages) {
+        if (!isOpen()) throw new SessionClosedDuringLoadError();
+        yield page;
     }
 }
 
-function getRequestedMcpServerNames(mcpServers: Array<acp.McpServer>): Array<string> {
-    return Array.from(new Set(mcpServers.map(server => sanitizeMcpServerName(server.name))));
+/** The page `first`, then the pages of `rest`. */
+async function* pagesStartingWith<T>(first: T[], rest: AsyncIterator<T[]>): AsyncGenerator<T[]> {
+    if (first.length > 0) yield first;
+    for (let page = await rest.next(); !page.done; page = await rest.next()) {
+        yield page.value;
+    }
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {
@@ -3681,39 +4169,15 @@ function hasExactKeys(value: Record<string, unknown>, expected: string[]): boole
     return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
-const MCP_STARTUP_AWAIT_TIMEOUT_META_KEY = "mcpStartupAwaitTimeoutMs";
-
-function parseMcpStartupAwaitTimeoutMs(meta: Record<string, unknown> | null | undefined): number | undefined {
-    const value = meta?.[MCP_STARTUP_AWAIT_TIMEOUT_META_KEY];
-    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-// Resolves once `startup` settles, or once `timeoutMs` elapses, whichever comes first.
-// A startup rejection is only propagated if it happens before the timeout.
-function raceMcpStartupTimeout(startup: Promise<McpStartupResult>, timeoutMs: number): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const timer = setTimeout(() => {
-            if (!settled) {
-                settled = true;
-                resolve();
-            }
-        }, timeoutMs);
-        startup.then(
-            () => {
-                if (!settled) {
-                    settled = true;
-                    clearTimeout(timer);
-                    resolve();
-                }
-            },
-            (err) => {
-                if (!settled) {
-                    settled = true;
-                    clearTimeout(timer);
-                    reject(err);
-                }
-            },
-        );
-    });
+/** The pages of `pages`. Adds the id of each command item to `commandIds`. */
+async function* withCommandIds(
+    pages: AsyncIterable<ThreadItem[]>,
+    commandIds: Set<string>,
+): AsyncGenerator<ThreadItem[]> {
+    for await (const items of pages) {
+        for (const item of items) {
+            if (item.type === "commandExecution") commandIds.add(item.id);
+        }
+        yield items;
+    }
 }
