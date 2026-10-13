@@ -2056,7 +2056,7 @@ export class CodexAcpServer {
         params: KandevGuardedTtyCapabilityRequest,
     ): KandevGuardedTtyCapabilityResponse {
         const sessionState = this.sessions.get(params.sessionId);
-        if (this.acpDisconnected || !sessionState || !this.sessionPublishIsCurrent(
+        if (this.acpDisconnected || !sessionState || !this.guardedTtySessionIsLive(sessionState) || !this.sessionPublishIsCurrent(
             sessionState,
             this.getSessionGeneration(params.sessionId),
         )) {
@@ -2077,7 +2077,7 @@ export class CodexAcpServer {
         requestSignal?: AbortSignal,
     ): Promise<KandevGuardedTtyExecReceipt> {
         const sessionState = this.sessions.get(params.sessionId);
-        if (this.acpDisconnected || !sessionState || this.sessionIsClosing(params.sessionId)) {
+        if (this.acpDisconnected || !sessionState || !this.guardedTtySessionIsLive(sessionState) || this.sessionIsClosing(params.sessionId)) {
             return createUndispatchedGuardedTtyReceipt(params.sessionId, "stale_session");
         }
         const sessionGeneration = this.getSessionGeneration(params.sessionId);
@@ -2100,6 +2100,7 @@ export class CodexAcpServer {
                 sandboxPolicy: sessionState.agentMode.sandboxPolicy,
                 signal: controller.signal,
                 isSessionCurrent: () => !this.acpDisconnected
+                    && this.guardedTtySessionIsLive(sessionState)
                     && this.sessionPublishIsCurrent(sessionState, sessionGeneration),
             });
         } finally {
@@ -2109,6 +2110,11 @@ export class CodexAcpServer {
                 this.guardedTtyExecutions.delete(params.sessionId);
             }
         }
+    }
+
+    /** A recovered thread is unavailable until it is loaded in the installed app-server generation. */
+    private guardedTtySessionIsLive(sessionState: SessionState): boolean {
+        return this.recovery === null || this.recovery.sessionIsLive(sessionState);
     }
 
     private parseGuardedTtyCapabilityParams(

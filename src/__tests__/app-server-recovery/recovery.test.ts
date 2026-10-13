@@ -4,6 +4,10 @@ import {ConnectionError, ConnectionErrors, ResponseError} from "vscode-jsonrpc/n
 import {createRecoveryFixture, defaultAnswer, initialize, MODEL, type RecoveryFixture, requestsOf} from "./recovery-fixture";
 import {AppServerRecovery} from "../../app-server-recovery/AppServerRecovery";
 import type {CodexAcpClient} from "../../CodexAcpClient";
+import {
+    KANDEV_GUARDED_TTY_CAPABILITY_METHOD,
+    KANDEV_GUARDED_TTY_EXEC_METHOD,
+} from "../../AcpExtensions";
 
 const resumed = (id: string) => ({
     thread: {id, turns: [], historyMode: "paginated", status: {type: "idle"}, preview: "", ephemeral: false, modelProvider: "openai",
@@ -47,6 +51,25 @@ function completeTurn(fixture: RecoveryFixture, sessionId: string, turnId = "tur
 }
 
 describe("app-server recovery", () => {
+    it("fails closed for guarded TTY while a recovered session is not live", async () => {
+        const fixture = createRecoveryFixture();
+        const sessionId = await openSession(fixture);
+
+        await fixture.kill();
+
+        await expect(fixture.agent.extMethod(KANDEV_GUARDED_TTY_CAPABILITY_METHOD, {sessionId}))
+            .rejects.toThrow("Unknown or stale session");
+        await expect(fixture.agent.extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId,
+            argv: ["pwd"],
+        })).resolves.toMatchObject({
+            outcome: "denied",
+            denial_code: "stale_session",
+            dispatched_tty: false,
+        });
+        expect(requestsOf(fixture.current(), "command/exec")).toEqual([]);
+    });
+
     it("starts the app-server again on the next request after an idle crash, with the same handshake", async () => {
         const fixture = createRecoveryFixture();
         await openSession(fixture);

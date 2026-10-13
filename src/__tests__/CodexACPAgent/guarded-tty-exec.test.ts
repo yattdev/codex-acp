@@ -38,6 +38,16 @@ function installSession(
     return state;
 }
 
+function markRecoverySessionNotLive(fixture: CodexMockTestFixture): void {
+    const agent = fixture.getCodexAcpAgent() as unknown as {
+        recovery: {sessionIsLive: (session: SessionState | undefined) => boolean} | null;
+    };
+    Object.defineProperty(agent, "recovery", {
+        configurable: true,
+        value: {sessionIsLive: () => false},
+    });
+}
+
 function outputDelta(processId: string, stream: "stdout" | "stderr", bytes: Uint8Array, capReached = false) {
     return {
         method: "command/exec/outputDelta" as const,
@@ -97,6 +107,26 @@ describe("Kandev guarded TTY ACP extension", () => {
         await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_CAPABILITY_METHOD, {
             sessionId: "stale-session",
         })).rejects.toThrow("Unknown or stale session");
+    });
+
+    it("fails closed while recovery has not loaded the session into its installed generation", async () => {
+        const fixture = createCodexMockTestFixture();
+        installSession(fixture);
+        markRecoverySessionNotLive(fixture);
+        const commandExec = vi.spyOn(fixture.getCodexAppServerClient(), "commandExec");
+
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_CAPABILITY_METHOD, {
+            sessionId: "session-id",
+        })).rejects.toThrow("Unknown or stale session");
+        await expect(fixture.getCodexAcpAgent().extMethod(KANDEV_GUARDED_TTY_EXEC_METHOD, {
+            sessionId: "session-id",
+            argv: ["pwd"],
+        })).resolves.toMatchObject({
+            outcome: "denied",
+            denial_code: "stale_session",
+            dispatched_tty: false,
+        });
+        expect(commandExec).not.toHaveBeenCalled();
     });
 
     it("rejects empty, oversized, malformed, and security-field requests before dispatch", async () => {
